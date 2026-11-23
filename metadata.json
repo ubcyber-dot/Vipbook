@@ -1,0 +1,6 @@
+{
+  "name": "VIP & Standard Seat Booking Lookup",
+  "description": "ระบบค้นหาและตรวจสอบข้อมูลการจองโต๊ะ VIP และ Standard เชื่อมต่อข้อมูลจริงจาก Google Sheets พร้อมระบบตรวจสอบสลิปโอนเงิน Dashboard สรุปยอด และผังโต๊ะแบบ Grid",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
