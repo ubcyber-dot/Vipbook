@@ -1,35 +1,33 @@
 import React from 'react';
-import { Cloud, CheckCircle2, RefreshCw, LogOut, UserCheck } from 'lucide-react';
+import {
+  Cloud,
+  CloudUpload,
+  CheckCircle2,
+  RefreshCw,
+  Settings,
+} from 'lucide-react';
 import { ActiveTab } from '../types/booking';
 
 interface NavbarProps {
   activeTab: ActiveTab;
   onSelectTab: (tab: ActiveTab) => void;
   onOpenSettings: () => void;
-  isConnected: boolean;
-  spreadsheetTitle?: string;
-  userEmail?: string | null;
-  isAuthenticated?: boolean;
-  hasDriveToken?: boolean;
-  cloudSyncStatus?: 'idle' | 'saving' | 'saved' | 'loading' | 'error';
-  lastCloudSavedAt?: string | null;
-  onRequestGoogleLogin?: () => void;
-  onSaveToCloudDrive?: () => void;
-  onLogout?: () => void;
+  onOpenDriveModal: () => void;
+  isDriveConnected: boolean;
+  driveUserLabel?: string | null;
+  isDriveUploading?: boolean;
+  onConnectOrSaveDrive: () => void;
 }
 
 export const Navbar: React.FC<NavbarProps> = ({
   activeTab,
   onSelectTab,
   onOpenSettings,
-  userEmail,
-  isAuthenticated = false,
-  hasDriveToken = false,
-  cloudSyncStatus = 'idle',
-  lastCloudSavedAt,
-  onRequestGoogleLogin,
-  onSaveToCloudDrive,
-  onLogout,
+  onOpenDriveModal,
+  isDriveConnected,
+  driveUserLabel,
+  isDriveUploading = false,
+  onConnectOrSaveDrive,
 }) => {
   return (
     <header className="sticky top-0 z-30 bg-white border-b-2 border-slate-300 px-4 sm:px-6 py-3 shadow-2xs">
@@ -101,69 +99,51 @@ export const Navbar: React.FC<NavbarProps> = ({
           </button>
         </nav>
 
-        {/* Zone 3: Persistent Email Login & Google Drive Cloud Sync Action */}
+        {/* Zone 3: Real Google Drive GIS Connection & Settings Actions */}
         <div className="flex items-center gap-2 shrink-0">
-          {isAuthenticated && userEmail ? (
-            <>
-              <div className="hidden md:flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-slate-100 border border-slate-200 text-xs font-semibold text-slate-700">
-                <UserCheck className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
-                <span className="truncate max-w-[180px]" title={`เข้าสู่ระบบถาวร: ${userEmail}`}>
-                  {userEmail}
-                </span>
-              </div>
+          <button
+            type="button"
+            onClick={onOpenDriveModal}
+            title="Google Drive Settings (Client ID & Upload Options)"
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold text-slate-700 bg-slate-100 hover:bg-slate-200 border border-slate-300 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+          >
+            <Settings className="w-3.5 h-3.5" />
+            <span>Drive Settings</span>
+          </button>
 
-              <button
-                type="button"
-                onClick={onSaveToCloudDrive}
-                title={
-                  lastCloudSavedAt
-                    ? `ซิงค์ข้อมูลลง Google Drive (${userEmail}) ล่าสุดเมื่อ ${new Date(
-                        lastCloudSavedAt
-                      ).toLocaleTimeString('th-TH')}`
-                    : `คลิกเพื่อซิงค์ข้อมูลลง Google Drive (${userEmail})`
-                }
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-              >
-                {cloudSyncStatus === 'saving' || cloudSyncStatus === 'loading' ? (
-                  <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                ) : hasDriveToken ? (
-                  <CheckCircle2 className="w-3.5 h-3.5" />
-                ) : (
-                  <Cloud className="w-3.5 h-3.5" />
-                )}
-                <span>
-                  {cloudSyncStatus === 'saving'
-                    ? 'กำลังซิงค์...'
-                    : cloudSyncStatus === 'loading'
-                    ? 'กำลังโหลด...'
-                    : hasDriveToken
-                    ? 'ซิงค์ Drive แล้ว'
-                    : 'ซิงค์ Google Drive'}
-                </span>
-              </button>
-
-              {onLogout && (
-                <button
-                  type="button"
-                  onClick={onLogout}
-                  title="ออกจากระบบ (ล้างการจดจำอีเมลถาวร)"
-                  className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-semibold text-slate-600 hover:text-red-600 bg-white hover:bg-red-50 border border-slate-200 hover:border-red-200 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-                >
-                  <LogOut className="w-3.5 h-3.5" />
-                  <span className="hidden sm:inline">ออกจากระบบ</span>
-                </button>
-              )}
-            </>
-          ) : (
-            <button
-              type="button"
-              onClick={onRequestGoogleLogin}
-              className="inline-flex items-center gap-2 px-4 py-2 text-xs font-bold text-white bg-slate-900 hover:bg-slate-800 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-            >
-              <Cloud className="w-3.5 h-3.5" />
-              <span>เข้าสู่ระบบอีเมล (จดจำถาวร)</span>
-            </button>
-          )}
+          <button
+            type="button"
+            onClick={onConnectOrSaveDrive}
+            disabled={isDriveUploading}
+            title={
+              isDriveConnected
+                ? `Connected to Google Drive${driveUserLabel ? ` (${driveUserLabel})` : ''} — Click to Save to Google Drive`
+                : 'Connect Google Drive via Google Identity Services (OAuth 2.0)'
+            }
+            className={`inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-bold text-white rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-60 ${
+              isDriveConnected
+                ? 'bg-emerald-600 hover:bg-emerald-700'
+                : 'bg-blue-600 hover:bg-blue-700'
+            }`}
+          >
+            {isDriveUploading ? (
+              <>
+                <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                <span>Uploading...</span>
+              </>
+            ) : isDriveConnected ? (
+              <>
+                <CloudUpload className="w-3.5 h-3.5" />
+                <span>Save to Google Drive</span>
+                <CheckCircle2 className="w-3.5 h-3.5 text-emerald-200" />
+              </>
+            ) : (
+              <>
+                <Cloud className="w-3.5 h-3.5" />
+                <span>Connect Google Drive</span>
+              </>
+            )}
+          </button>
         </div>
       </div>
     </header>

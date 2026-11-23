@@ -8,15 +8,16 @@ import {
   FileSpreadsheet,
   AlertTriangle,
   RefreshCw,
-  LogOut,
   Settings,
   ExternalLink,
   Search,
   Share2,
   FolderOpen,
   Cloud,
-  CloudCheck,
   CloudUpload,
+  CheckCircle2,
+  AlertCircle,
+  X,
 } from 'lucide-react';
 import {
   ActiveTab,
@@ -30,7 +31,6 @@ import {
 import {
   initAuth,
   googleSignIn,
-  logout,
   getPersistentUser,
   hasActiveDriveToken,
   PersistentUserProfile,
@@ -42,13 +42,22 @@ import {
   listDriveSpreadsheets,
   loadCloudStateFromDrive,
   saveCloudStateToDrive,
-  syncStateToNewGoogleSheet,
   TemplateSheetPayload,
 } from './services/sheetsApi';
+import {
+  DriveConnectionState,
+  DriveUploadedFile,
+  connectGoogleDrive,
+  getDriveConnectionState,
+  getStoredDriveClientId,
+  subscribeDriveConnection,
+  uploadFileToGoogleDrive,
+} from './services/googleDriveGis';
 import {
   buildBatchReadResponseFromSheets,
   createInitialTemplateResponse,
   exportCurrentDataToExcel,
+  generateCurrentDataExcelBytes,
   resolveColumnMapFromRow,
   STANDARD_TEMPLATE_HEADERS,
 } from './utils/excelTemplate';
@@ -59,6 +68,7 @@ import { SeatMapView } from './components/SeatMapView';
 import { BackOfficeView } from './components/BackOfficeView';
 import { SettingsModal } from './components/SettingsModal';
 import { ExcelTemplateImporter } from './components/ExcelTemplateImporter';
+import { GoogleDriveModal } from './components/GoogleDriveModal';
 
 const STORAGE_KEY_CATEGORIES = 'seat_lookup_categories_v1';
 const STORAGE_KEY_SPREADSHEET_ID = 'seat_lookup_spreadsheet_id_v2';
@@ -124,26 +134,50 @@ function loadSavedExpenses(): ExpenseRecord[] {
   return [];
 }
 
+function buildTimestampedFilename(format: 'xlsx' | 'json'): string {
+  const now = new Date();
+  const yyyy = now.getFullYear();
+  const mm = String(now.getMonth() + 1).padStart(2, '0');
+  const dd = String(now.getDate()).padStart(2, '0');
+  const hh = String(now.getHours()).padStart(2, '0');
+  const min = String(now.getMinutes()).padStart(2, '0');
+  return format === 'xlsx'
+    ? `Seat_Bookings_VIP_Standard_${yyyy}-${mm}-${dd}_${hh}${min}.xlsx`
+    : `Seat_Booking_System_Backup_${yyyy}-${mm}-${dd}_${hh}${min}.json`;
+}
+
 export default function App() {
   const [activeTab, setActiveTab] = useState<ActiveTab>('lookup');
   const [seatMapCategoryFilter, setSeatMapCategoryFilter] = useState<string>('all');
 
-  // Persistent Email Auth State (remains logged in permanently until explicit logout)
+  // Legacy Firebase Auth state (used only if user picks an existing Google Sheet to import)
   const [persistentUser, setPersistentUser] = useState<PersistentUserProfile | null>(() =>
     getPersistentUser()
   );
-  const [hasDriveToken, setHasDriveToken] = useState<boolean>(() => hasActiveDriveToken());
-  const [isLoggingIn, setIsLoggingIn] = useState<boolean>(false);
+  const [hasLegacySheetToken, setHasLegacySheetToken] = useState<boolean>(() =>
+    hasActiveDriveToken()
+  );
+  const [isLoggingInSheets, setIsLoggingInSheets] = useState<boolean>(false);
   const [authError, setAuthError] = useState<string | null>(null);
 
-  const isLoggedIn = Boolean(persistentUser);
   const userEmail = persistentUser?.email || null;
+
+  // REAL Google Identity Services (GIS) + Google Drive API v3 State
+  const [driveConnection, setDriveConnection] = useState<DriveConnectionState>(() =>
+    getDriveConnectionState()
+  );
+  const [isDriveModalOpen, setIsDriveModalOpen] = useState<boolean>(false);
+  const [isDriveConnecting, setIsDriveConnecting] = useState<boolean>(false);
+  const [isDriveUploading, setIsDriveUploading] = useState<boolean>(false);
+  const [driveError, setDriveError] = useState<string | null>(null);
+  const [lastDriveFile, setLastDriveFile] = useState<DriveUploadedFile | null>(null);
 
   // Configuration & Expenses State
   const [categories, setCategories] = useState<CategoryConfig[]>(loadSavedCategories);
   const [expenses, setExpenses] = useState<ExpenseRecord[]>(loadSavedExpenses);
+  const [storageWarning, setStorageWarning] = useState<string | null>(null);
 
-  // Load persisted Excel template session if available (or auto-create default template so logged-in user enters ready workspace)
+  // Load persisted Excel template session if available (or auto-create default template)
   const initialTemplateSession = useMemo(() => {
     const saved = loadSavedTemplateSession();
     if (saved) return saved;
@@ -153,7 +187,7 @@ export default function App() {
       localStorage.setItem(STORAGE_KEY_TEMPLATE_SESSION, JSON.stringify(defaultRes));
       localStorage.removeItem(STORAGE_KEY_SPREADSHEET_ID);
     } catch {
-      // ignore
+      // ignore initial storage error
     }
     return defaultRes;
   }, []);
@@ -163,7 +197,6 @@ export default function App() {
     return localStorage.getItem(STORAGE_KEY_SPREADSHEET_ID) || 'template-import';
   });
 
-  // Connected Spreadsheet / Excel Template Data State
   const [spreadsheetTitle, setSpreadsheetTitle] = useState<string>(
     () => initialTemplateSession?.spreadsheetTitle || ''
   );
@@ -182,18 +215,11 @@ export default function App() {
   const [isLoadingData, setIsLoadingData] = useState<boolean>(false);
   const [dataError, setDataError] = useState<string | null>(null);
 
-  // Google Drive Cloud Persistence State
-  const [cloudFileId, setCloudFileId] = useState<string | null>(null);
-  const [cloudSyncStatus, setCloudSyncStatus] = useState<
-    'idle' | 'saving' | 'saved' | 'loading' | 'error'
-  >('idle');
-  const [lastCloudSavedAt, setLastCloudSavedAt] = useState<string | null>(null);
-  const [cloudError, setCloudError] = useState<string | null>(null);
-  const [syncedGoogleSheetUrl, setSyncedGoogleSheetUrl] = useState<string | null>(null);
-  const hasLoadedInitialCloudRef = useRef<boolean>(false);
-  const skipNextAutoSaveRef = useRef<boolean>(false);
+  // Local server backup state (strictly separated from real Google Drive uploads)
+  const hasLoadedServerBackupRef = useRef<boolean>(false);
+  const skipNextServerBackupRef = useRef<boolean>(false);
 
-  // Drive Files for Shared / All picker when no spreadsheet is selected yet
+  // Drive Files for Shared / All Google Sheets import picker
   const [driveFilter, setDriveFilter] = useState<DriveFilterMode>('sharedWithMe');
   const [driveFiles, setDriveFiles] = useState<SpreadsheetFileItem[]>([]);
   const [driveSearchQuery, setDriveSearchQuery] = useState<string>('');
@@ -202,7 +228,7 @@ export default function App() {
   // Settings Modal State
   const [isSettingsOpen, setIsSettingsOpen] = useState<boolean>(false);
 
-  // Clean up legacy v1 key that may have held an invalid URL/ID
+  // Clean up legacy v1 key
   useEffect(() => {
     try {
       localStorage.removeItem('seat_lookup_spreadsheet_id_v1');
@@ -211,23 +237,29 @@ export default function App() {
     }
   }, []);
 
-  // Initialize Firebase Auth Listener (Preserves persistent email login across reloads)
+  // Subscribe to real Google Drive GIS connection state changes
+  useEffect(() => {
+    return subscribeDriveConnection((nextState) => {
+      setDriveConnection(nextState);
+    });
+  }, []);
+
+  // Initialize Firebase Auth Listener (for optional Google Sheets import picker)
   useEffect(() => {
     const unsubscribe = initAuth(
       (profile, tokenActive) => {
         setPersistentUser(profile);
-        setHasDriveToken(tokenActive);
+        setHasLegacySheetToken(tokenActive);
       },
       () => {
         setPersistentUser(null);
-        setHasDriveToken(false);
-        hasLoadedInitialCloudRef.current = false;
+        setHasLegacySheetToken(false);
       }
     );
     return () => unsubscribe();
   }, []);
 
-  // Persist categories in localStorage whenever modified
+  // Safely persist categories in localStorage
   useEffect(() => {
     try {
       localStorage.setItem(STORAGE_KEY_CATEGORIES, JSON.stringify(categories));
@@ -236,16 +268,49 @@ export default function App() {
     }
   }, [categories]);
 
-  // Persist expenses in localStorage whenever modified
+  // Safely persist expenses in localStorage
   useEffect(() => {
     try {
       localStorage.setItem(STORAGE_KEY_EXPENSES, JSON.stringify(expenses));
-    } catch (e) {
+      setStorageWarning(null);
+    } catch (e: any) {
+      if (e?.name === 'QuotaExceededError') {
+        setStorageWarning(
+          'พื้นที่เก็บข้อมูลในเบราว์เซอร์ใกล้เต็ม กรุณาบันทึกข้อมูลขึ้น Google Drive เพื่อสำรองข้อมูลอย่างปลอดภัย'
+        );
+      }
       console.error('Failed to save expenses:', e);
     }
   }, [expenses]);
 
-  // Persist spreadsheetId in localStorage (only for real Drive spreadsheet IDs)
+  // Safely persist current session categoryResults whenever modified
+  useEffect(() => {
+    if (categoryResults.length === 0) return;
+    try {
+      const sessionPayload: BatchReadResponse = {
+        spreadsheetId: spreadsheetId || 'template-import',
+        spreadsheetTitle: spreadsheetTitle || 'ข้อมูลการจองโต๊ะ (แก้ไขล่าสุด)',
+        spreadsheetUrl,
+        availableSheets,
+        categoryResults,
+        fetchedAt: lastSyncedAt || new Date().toISOString(),
+      };
+      localStorage.setItem(
+        STORAGE_KEY_TEMPLATE_SESSION,
+        JSON.stringify(sessionPayload)
+      );
+      setStorageWarning(null);
+    } catch (e: any) {
+      if (e?.name === 'QuotaExceededError') {
+        setStorageWarning(
+          'พื้นที่เก็บข้อมูลในเบราว์เซอร์เต็ม (อาจเกิดจากรูปสลิปจำนวนมาก) กรุณาบันทึกไฟล์สำรองขึ้น Google Drive ทันที'
+        );
+      }
+      console.error('Failed to persist session records:', e);
+    }
+  }, [categoryResults, spreadsheetId, spreadsheetTitle, spreadsheetUrl, availableSheets, lastSyncedAt]);
+
+  // Persist spreadsheetId in localStorage (only for real Sheets spreadsheet IDs)
   useEffect(() => {
     try {
       if (spreadsheetId && spreadsheetId !== 'template-import') {
@@ -267,14 +332,7 @@ export default function App() {
     setLastSyncedAt(res.fetchedAt);
     setDataError(null);
 
-    if (isTemplate) {
-      try {
-        localStorage.setItem(STORAGE_KEY_TEMPLATE_SESSION, JSON.stringify(res));
-        localStorage.removeItem(STORAGE_KEY_SPREADSHEET_ID);
-      } catch (e) {
-        console.error('Failed to persist template session:', e);
-      }
-    } else {
+    if (!isTemplate) {
       try {
         localStorage.removeItem(STORAGE_KEY_TEMPLATE_SESSION);
       } catch {
@@ -283,197 +341,204 @@ export default function App() {
     }
   }, []);
 
-  /**
-   * Save current system state (`categories`, `categoryResults`, `expenses`) to Cloud & Google Drive
-   */
-  const handleSaveToCloudDrive = useCallback(
-    async (overrideState?: Partial<CloudSystemState>, _isInteractive = false) => {
-      if (!isLoggedIn) return;
+  // Load local server-side session backup on initial startup (if local browser session was empty/default)
+  useEffect(() => {
+    if (hasLoadedServerBackupRef.current) return;
+    hasLoadedServerBackupRef.current = true;
 
-      const targetCategories = overrideState?.categories ?? categories;
-      const targetResults = overrideState?.categoryResults ?? categoryResults;
-      const targetExpenses = overrideState?.expenses ?? expenses;
-      const targetTitle =
-        overrideState?.spreadsheetTitle ??
-        (spreadsheetTitle || 'ข้อมูลระบบจองโต๊ะ VIP & Standard (Google Drive Cloud)');
-      const targetSheets = overrideState?.availableSheets ?? availableSheets;
-
-      // Only save if there is meaningful data
-      if (targetResults.length === 0 && targetExpenses.length === 0) return;
-
-      setCloudSyncStatus('saving');
-      setCloudError(null);
-      try {
-        const nowIso = new Date().toISOString();
-        const payload: CloudSystemState = {
-          categories: targetCategories,
-          categoryResults: targetResults,
-          expenses: targetExpenses,
-          spreadsheetTitle: targetTitle,
-          availableSheets: targetSheets,
-          updatedAt: nowIso,
-        };
-        const res = await saveCloudStateToDrive(payload, cloudFileId, userEmail);
-        setCloudFileId(res.fileId);
-        setLastCloudSavedAt(res.modifiedTime || nowIso);
-        setCloudSyncStatus('saved');
-      } catch (err: any) {
-        console.error('Failed to save state to Cloud:', err);
-        if (err.code === 'UNAUTHENTICATED') {
-          setHasDriveToken(false);
-        }
-        setCloudSyncStatus('error');
-        setCloudError(err.message || 'ไม่สามารถบันทึกข้อมูลลง Cloud ได้');
-      }
-    },
-    [
-      isLoggedIn,
-      userEmail,
-      categories,
-      categoryResults,
-      expenses,
-      spreadsheetTitle,
-      availableSheets,
-      cloudFileId,
-    ]
-  );
-
-  /**
-   * Load saved system state from Cloud & Google Drive
-   */
-  const handleLoadFromCloudDrive = useCallback(
-    async (_isInteractive = false) => {
-      if (!isLoggedIn) return;
-
-      setCloudSyncStatus('loading');
-      setCloudError(null);
+    const loadServerBackup = async () => {
       try {
         const res = await loadCloudStateFromDrive(userEmail);
         if (res.found && res.state && Array.isArray(res.state.categoryResults)) {
-          skipNextAutoSaveRef.current = true;
-          setCloudFileId(res.fileId || null);
-
-          if (Array.isArray(res.state.categories) && res.state.categories.length > 0) {
-            setCategories(res.state.categories);
-          }
-          if (Array.isArray(res.state.expenses)) {
-            setExpenses(res.state.expenses);
-          }
-
-          const loadedTitle =
-            res.state.spreadsheetTitle || 'ข้อมูลจาก Google Drive Cloud';
-          const loadedSheets =
-            res.state.availableSheets ||
-            res.state.categoryResults.map((r) => r.sheetName);
-          const loadedTime =
-            res.modifiedTime || res.state.updatedAt || new Date().toISOString();
-
-          applyBatchResponse(
-            {
-              spreadsheetId: 'template-import',
-              spreadsheetTitle: loadedTitle,
-              spreadsheetUrl: '',
-              availableSheets: loadedSheets,
-              categoryResults: res.state.categoryResults,
-              fetchedAt: loadedTime,
-            },
-            true
+          // Only overwrite if local browser storage didn't already have newer edits
+          const localTime = lastSyncedAt ? Date.parse(lastSyncedAt) : 0;
+          const serverTime = Date.parse(res.modifiedTime || res.state.updatedAt || '');
+          const hasLocalBooked = categoryResults.some((c) =>
+            c.records.some((r) => r.isBooked)
           );
-
-          setLastCloudSavedAt(loadedTime);
-          setCloudSyncStatus('saved');
-        } else {
-          // No cloud file yet for this user:
-          // If user already has local data on this device, back it up immediately!
-          if (categoryResults.length > 0 || expenses.length > 0) {
-            await handleSaveToCloudDrive(undefined, false);
-          } else {
-            setCloudSyncStatus('idle');
+          if (!hasLocalBooked || (Number.isFinite(serverTime) && serverTime > localTime)) {
+            skipNextServerBackupRef.current = true;
+            if (Array.isArray(res.state.categories) && res.state.categories.length > 0) {
+              setCategories(res.state.categories);
+            }
+            if (Array.isArray(res.state.expenses)) {
+              setExpenses(res.state.expenses);
+            }
+            applyBatchResponse(
+              {
+                spreadsheetId: 'template-import',
+                spreadsheetTitle:
+                  res.state.spreadsheetTitle || 'ข้อมูลระบบจองโต๊ะ VIP & Standard',
+                spreadsheetUrl: '',
+                availableSheets:
+                  res.state.availableSheets ||
+                  res.state.categoryResults.map((r) => r.sheetName),
+                categoryResults: res.state.categoryResults,
+                fetchedAt: res.modifiedTime || res.state.updatedAt || new Date().toISOString(),
+              },
+              true
+            );
           }
         }
-      } catch (err: any) {
-        console.error('Failed to load cloud state:', err);
-        if (err.code === 'UNAUTHENTICATED') {
-          setHasDriveToken(false);
-        }
-        setCloudSyncStatus('idle');
-      } finally {
-        hasLoadedInitialCloudRef.current = true;
+      } catch {
+        // Server local backup is optional; never block UI
       }
-    },
-    [
-      isLoggedIn,
-      userEmail,
-      categoryResults.length,
-      expenses.length,
-      applyBatchResponse,
-      handleSaveToCloudDrive,
-    ]
-  );
+    };
 
-  // Automatically load cloud state when user is logged in
-  useEffect(() => {
-    if (isLoggedIn && !hasLoadedInitialCloudRef.current) {
-      handleLoadFromCloudDrive(false);
-    }
-  }, [isLoggedIn, handleLoadFromCloudDrive]);
+    loadServerBackup();
+  }, [userEmail, applyBatchResponse, categoryResults, lastSyncedAt]);
 
-  // Automatically sync changes (`categories`, `categoryResults`, `expenses`) to Cloud (debounced 800ms)
+  // Background debounced save to local server store so data survives browser cache clears
+  // (Never claims this is a Google Drive save!)
   useEffect(() => {
-    if (!isLoggedIn || !hasLoadedInitialCloudRef.current) return;
+    if (!hasLoadedServerBackupRef.current) return;
     if (categoryResults.length === 0 && expenses.length === 0) return;
-
-    if (skipNextAutoSaveRef.current) {
-      skipNextAutoSaveRef.current = false;
+    if (skipNextServerBackupRef.current) {
+      skipNextServerBackupRef.current = false;
       return;
     }
 
-    const timer = setTimeout(() => {
-      handleSaveToCloudDrive(undefined, false);
-    }, 800);
-
-    return () => clearTimeout(timer);
-  }, [isLoggedIn, categories, categoryResults, expenses, handleSaveToCloudDrive]);
-
-  /**
-   * Export & Sync current state into a live Google Spreadsheet inside the user's Google Drive
-   */
-  const handleExportToGoogleSheet = useCallback(async () => {
-    if (!isLoggedIn) return;
-    if (!hasActiveDriveToken()) {
-      try {
-        const signInRes = await googleSignIn({ loginHint: userEmail || undefined });
-        if (!signInRes) return;
-        setPersistentUser(signInRes.profile);
-        setHasDriveToken(true);
-      } catch (err: any) {
-        setCloudError(err.message || 'ไม่สามารถเชื่อมต่อ Google Drive ได้');
-        return;
-      }
-    }
-
-    setCloudSyncStatus('saving');
-    setCloudError(null);
-    try {
-      const sheetRes = await syncStateToNewGoogleSheet(
+    const timer = window.setTimeout(() => {
+      const payload: CloudSystemState = {
         categories,
         categoryResults,
         expenses,
-        spreadsheetTitle
-          ? `${spreadsheetTitle} (ซิงค์ล่าสุด)`
-          : 'ระบบจองโต๊ะ VIP & Standard และรายจ่าย'
+        spreadsheetTitle: spreadsheetTitle || 'ระบบจองโต๊ะ VIP & Standard',
+        availableSheets,
+        updatedAt: new Date().toISOString(),
+      };
+      saveCloudStateToDrive(payload, null, userEmail).catch(() => {
+        // Silent background local server cache backup
+      });
+    }, 1500);
+
+    return () => window.clearTimeout(timer);
+  }, [categories, categoryResults, expenses, spreadsheetTitle, availableSheets, userEmail]);
+
+  /**
+   * REAL Google Identity Services (GIS) OAuth 2.0 Sign-In for Google Drive
+   */
+  const handleConnectGoogleDrive = useCallback(async () => {
+    const clientId = getStoredDriveClientId();
+    if (!clientId) {
+      setDriveError(
+        'Please paste your Google Cloud OAuth Client ID in Google Drive Settings first.'
       );
-      if (sheetRes.spreadsheetUrl) {
-        setSyncedGoogleSheetUrl(sheetRes.spreadsheetUrl);
-        setSpreadsheetUrl(sheetRes.spreadsheetUrl);
-      }
-      setCloudSyncStatus('saved');
-    } catch (err: any) {
-      console.error('Failed to create Google Sheet in Drive:', err);
-      setCloudSyncStatus('error');
-      setCloudError(err.message || 'ไม่สามารถสร้างไฟล์ Google Sheets ใน Drive ได้');
+      setIsDriveModalOpen(true);
+      return;
     }
-  }, [isLoggedIn, userEmail, categories, categoryResults, expenses, spreadsheetTitle]);
+
+    setIsDriveConnecting(true);
+    setDriveError(null);
+    try {
+      await connectGoogleDrive(clientId, { prompt: 'consent' });
+    } catch (err: any) {
+      setDriveError(err?.message || 'Failed to connect to Google Drive.');
+    } finally {
+      setIsDriveConnecting(false);
+    }
+  }, []);
+
+  /**
+   * REAL Google Drive API v3 Multipart Upload to user's Google Drive Root Folder
+   */
+  const handleQuickSaveToGoogleDrive = useCallback(
+    async (format: 'xlsx' | 'json' = 'xlsx') => {
+      const clientId = getStoredDriveClientId();
+      if (!clientId) {
+        setDriveError(
+          'Please configure your Google Cloud OAuth Client ID in Google Drive Settings first.'
+        );
+        setIsDriveModalOpen(true);
+        return;
+      }
+
+      setIsDriveUploading(true);
+      setDriveError(null);
+
+      try {
+        if (!getDriveConnectionState().connected) {
+          await connectGoogleDrive(clientId, { prompt: 'consent' });
+        }
+
+        const filename = buildTimestampedFilename(format);
+        let uploaded: DriveUploadedFile;
+
+        if (format === 'xlsx') {
+          const excelBytes = generateCurrentDataExcelBytes(
+            categories,
+            categoryResults,
+            expenses
+          );
+          uploaded = await uploadFileToGoogleDrive({
+            filename,
+            mimeType:
+              'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            content: excelBytes,
+            description:
+              'VIP & Standard Seat Booking & Back-Office Expenses Excel Export',
+          });
+        } else {
+          const payload: CloudSystemState = {
+            categories,
+            categoryResults,
+            expenses,
+            spreadsheetTitle:
+              spreadsheetTitle || 'VIP & Standard Seat Booking System',
+            availableSheets,
+            updatedAt: new Date().toISOString(),
+          };
+          uploaded = await uploadFileToGoogleDrive({
+            filename,
+            mimeType: 'application/json',
+            content: JSON.stringify(payload, null, 2),
+            description:
+              'VIP & Standard Seat Booking System Complete JSON Backup',
+          });
+        }
+
+        setLastDriveFile(uploaded);
+      } catch (err: any) {
+        setDriveError(
+          err?.message || 'Failed to upload file to Google Drive. Please try again.'
+        );
+      } finally {
+        setIsDriveUploading(false);
+      }
+    },
+    [categories, categoryResults, expenses, spreadsheetTitle, availableSheets]
+  );
+
+  /**
+   * Restore full app state from a real JSON backup file downloaded from Google Drive
+   */
+  const handleRestoreFromGoogleDrive = useCallback(
+    (state: CloudSystemState, sourceFile: DriveUploadedFile) => {
+      if (Array.isArray(state.categories) && state.categories.length > 0) {
+        setCategories(state.categories);
+      }
+      if (Array.isArray(state.expenses)) {
+        setExpenses(state.expenses);
+      }
+      applyBatchResponse(
+        {
+          spreadsheetId: 'template-import',
+          spreadsheetTitle:
+            state.spreadsheetTitle || `กู้คืนจาก Google Drive (${sourceFile.name})`,
+          spreadsheetUrl: '',
+          availableSheets:
+            state.availableSheets ||
+            state.categoryResults.map((r) => r.sheetName),
+          categoryResults: state.categoryResults,
+          fetchedAt: sourceFile.modifiedTime || state.updatedAt || new Date().toISOString(),
+        },
+        true
+      );
+      setLastDriveFile(sourceFile);
+      setIsDriveModalOpen(false);
+    },
+    [applyBatchResponse]
+  );
 
   const loadSheetData = useCallback(
     async (targetSpreadsheetId: string, targetCategories: CategoryConfig[]) => {
@@ -490,7 +555,7 @@ export default function App() {
       } catch (err: any) {
         console.error('Error loading spreadsheet data:', err);
         if (err.code === 'UNAUTHENTICATED') {
-          setHasDriveToken(false);
+          setHasLegacySheetToken(false);
         }
         setDataError(
           err.message ||
@@ -503,14 +568,12 @@ export default function App() {
     [applyBatchResponse]
   );
 
-  // Automatically load sheet data when Drive token is active and a Drive spreadsheetId is set
   useEffect(() => {
-    if (hasDriveToken && spreadsheetId && spreadsheetId !== 'template-import') {
+    if (hasLegacySheetToken && spreadsheetId && spreadsheetId !== 'template-import') {
       loadSheetData(spreadsheetId, categories);
     }
-  }, [hasDriveToken, spreadsheetId, categories, loadSheetData]);
+  }, [hasLegacySheetToken, spreadsheetId, categories, loadSheetData]);
 
-  // Load Drive spreadsheet list when Drive token is active and no spreadsheet is chosen yet
   const loadInitialDriveSpreadsheets = useCallback(
     async (query = '', mode: DriveFilterMode = driveFilter) => {
       if (!hasActiveDriveToken()) return;
@@ -528,20 +591,19 @@ export default function App() {
   );
 
   useEffect(() => {
-    if (hasDriveToken && !spreadsheetId) {
+    if (hasLegacySheetToken && !spreadsheetId) {
       loadInitialDriveSpreadsheets(driveSearchQuery, driveFilter);
     }
-  }, [hasDriveToken, spreadsheetId, driveFilter, loadInitialDriveSpreadsheets]);
+  }, [hasLegacySheetToken, spreadsheetId, driveFilter, loadInitialDriveSpreadsheets, driveSearchQuery]);
 
-  const handleGoogleLogin = async () => {
-    setIsLoggingIn(true);
+  const handleLegacySheetsLogin = async () => {
+    setIsLoggingInSheets(true);
     setAuthError(null);
-    setCloudError(null);
     try {
       const result = await googleSignIn({ loginHint: userEmail || undefined });
       if (result) {
         setPersistentUser(result.profile);
-        setHasDriveToken(true);
+        setHasLegacySheetToken(true);
       }
     } catch (err: any) {
       const errorCode = err?.code || '';
@@ -553,24 +615,19 @@ export default function App() {
         return;
       }
       if (errorCode === 'auth/popup-blocked') {
-        setAuthError('เบราว์เซอร์บล็อกหน้าต่างป๊อปอัป กรุณาอนุญาตป๊อปอัปสำหรับเว็บไซต์นี้แล้วลองอีกครั้ง');
+        setAuthError(
+          'เบราว์เซอร์บล็อกหน้าต่างป๊อปอัป กรุณาอนุญาตป๊อปอัปสำหรับเว็บไซต์นี้แล้วลองอีกครั้ง'
+        );
         return;
       }
       setAuthError(err.message || 'การเข้าสู่ระบบด้วย Google ล้มเหลว กรุณาลองใหม่อีกครั้ง');
     } finally {
-      setIsLoggingIn(false);
+      setIsLoggingInSheets(false);
     }
   };
 
-  const handleLogout = async () => {
-    await logout();
-    setPersistentUser(null);
-    setHasDriveToken(false);
-    hasLoadedInitialCloudRef.current = false;
-  };
-
   /**
-   * 100% Client-Side Instant Excel Template Import (Zero network failure!)
+   * 100% Client-Side Instant Excel Template Import
    */
   const handleImportTemplateFiles = async (
     targetCategories: CategoryConfig[],
@@ -600,74 +657,45 @@ export default function App() {
     }
   };
 
-  /**
-   * One-Click Starter: Loads the standard pre-numbered VIP & Standard Excel template structure immediately
-   */
   const handleLoadDefaultTemplate = useCallback(() => {
     const res = createInitialTemplateResponse(categories);
     applyBatchResponse(res, true);
   }, [categories, applyBatchResponse]);
 
   /**
-   * Persist edited categoryResults into localStorage session so live edits survive page reloads
+   * Functional state updates eliminate stale-closure bugs during rapid edits
    */
-  const persistUpdatedCategoryResults = useCallback(
-    (nextResults: CategorySheetResult[]) => {
-      const nowIso = new Date().toISOString();
-      setCategoryResults(nextResults);
-      setLastSyncedAt(nowIso);
-      try {
-        const sessionPayload: BatchReadResponse = {
-          spreadsheetId: spreadsheetId || 'template-import',
-          spreadsheetTitle: spreadsheetTitle || 'ข้อมูลการจองโต๊ะ (แก้ไขล่าสุด)',
-          spreadsheetUrl,
-          availableSheets,
-          categoryResults: nextResults,
-          fetchedAt: nowIso,
-        };
-        localStorage.setItem(
-          STORAGE_KEY_TEMPLATE_SESSION,
-          JSON.stringify(sessionPayload)
-        );
-      } catch (e) {
-        console.error('Failed to persist updated records:', e);
-      }
-    },
-    [spreadsheetId, spreadsheetTitle, spreadsheetUrl, availableSheets]
-  );
-
-  const handleUpdateRecord = useCallback(
-    (updated: SeatRecord) => {
-      const nextResults = categoryResults.map((catRes) => {
+  const handleUpdateRecord = useCallback((updated: SeatRecord) => {
+    setLastSyncedAt(new Date().toISOString());
+    setCategoryResults((prev) =>
+      prev.map((catRes) => {
         if (catRes.categoryId !== updated.categoryId) return catRes;
         return {
           ...catRes,
           records: catRes.records.map((r) => (r.id === updated.id ? updated : r)),
         };
-      });
-      persistUpdatedCategoryResults(nextResults);
-    },
-    [categoryResults, persistUpdatedCategoryResults]
-  );
+      })
+    );
+  }, []);
 
   const handleAddRecord = useCallback(
     (categoryId: string, newRecord: SeatRecord) => {
       const catConfig = categories.find((c) => c.id === categoryId);
-      const existsInResults = categoryResults.some((r) => r.categoryId === categoryId);
-
-      let nextResults: CategorySheetResult[];
-      if (existsInResults) {
-        nextResults = categoryResults.map((catRes) => {
-          if (catRes.categoryId !== categoryId) return catRes;
-          return {
-            ...catRes,
-            foundSheet: true,
-            records: [...catRes.records, newRecord],
-          };
-        });
-      } else {
-        nextResults = [
-          ...categoryResults,
+      setLastSyncedAt(new Date().toISOString());
+      setCategoryResults((prev) => {
+        const exists = prev.some((r) => r.categoryId === categoryId);
+        if (exists) {
+          return prev.map((catRes) => {
+            if (catRes.categoryId !== categoryId) return catRes;
+            return {
+              ...catRes,
+              foundSheet: true,
+              records: [...catRes.records, newRecord],
+            };
+          });
+        }
+        return [
+          ...prev,
           {
             categoryId,
             categoryName: catConfig?.name || categoryId,
@@ -677,31 +705,30 @@ export default function App() {
             records: [newRecord],
           },
         ];
-      }
-      persistUpdatedCategoryResults(nextResults);
+      });
     },
-    [categories, categoryResults, persistUpdatedCategoryResults]
+    [categories]
   );
 
   const handleAddMultipleRecords = useCallback(
     (categoryId: string, newRecords: SeatRecord[]) => {
       if (newRecords.length === 0) return;
       const catConfig = categories.find((c) => c.id === categoryId);
-      const existsInResults = categoryResults.some((r) => r.categoryId === categoryId);
-
-      let nextResults: CategorySheetResult[];
-      if (existsInResults) {
-        nextResults = categoryResults.map((catRes) => {
-          if (catRes.categoryId !== categoryId) return catRes;
-          return {
-            ...catRes,
-            foundSheet: true,
-            records: [...catRes.records, ...newRecords],
-          };
-        });
-      } else {
-        nextResults = [
-          ...categoryResults,
+      setLastSyncedAt(new Date().toISOString());
+      setCategoryResults((prev) => {
+        const exists = prev.some((r) => r.categoryId === categoryId);
+        if (exists) {
+          return prev.map((catRes) => {
+            if (catRes.categoryId !== categoryId) return catRes;
+            return {
+              ...catRes,
+              foundSheet: true,
+              records: [...catRes.records, ...newRecords],
+            };
+          });
+        }
+        return [
+          ...prev,
           {
             categoryId,
             categoryName: catConfig?.name || categoryId,
@@ -711,22 +738,20 @@ export default function App() {
             records: newRecords,
           },
         ];
-      }
-      persistUpdatedCategoryResults(nextResults);
+      });
     },
-    [categories, categoryResults, persistUpdatedCategoryResults]
+    [categories]
   );
 
-  const handleDeleteRecord = useCallback(
-    (recordId: string) => {
-      const nextResults = categoryResults.map((catRes) => ({
+  const handleDeleteRecord = useCallback((recordId: string) => {
+    setLastSyncedAt(new Date().toISOString());
+    setCategoryResults((prev) =>
+      prev.map((catRes) => ({
         ...catRes,
         records: catRes.records.filter((r) => r.id !== recordId),
-      }));
-      persistUpdatedCategoryResults(nextResults);
-    },
-    [categoryResults, persistUpdatedCategoryResults]
-  );
+      }))
+    );
+  }, []);
 
   const handleAddExpense = useCallback(
     (expenseInput: Omit<ExpenseRecord, 'id' | 'createdAt'>) => {
@@ -754,15 +779,50 @@ export default function App() {
     exportCurrentDataToExcel(categories, categoryResults, expenses);
   }, [categories, categoryResults, expenses]);
 
+  /**
+   * Reconciles categoryResults whenever categories are added, renamed, or deleted in SettingsModal
+   */
   const handleSaveSettings = (newId: string, newCategories: CategoryConfig[]) => {
     setCategories(newCategories);
+
     if (newId && newId !== 'template-import') {
       if (newId !== spreadsheetId) {
         setSpreadsheetId(newId);
       } else {
         loadSheetData(newId, newCategories);
       }
+      return;
     }
+
+    // Reconcile local template categoryResults with updated categories
+    setCategoryResults((prev) => {
+      const existingById = new Map(prev.map((r) => [r.categoryId, r]));
+      return newCategories.map((cat) => {
+        const existing = existingById.get(cat.id);
+        if (existing) {
+          return {
+            ...existing,
+            categoryName: cat.name,
+            sheetName: cat.sheetName,
+            records: existing.records.map((rec) => ({
+              ...rec,
+              categoryName: cat.name,
+              sheetName: cat.sheetName,
+            })),
+          };
+        }
+        return {
+          categoryId: cat.id,
+          categoryName: cat.name,
+          sheetName: cat.sheetName,
+          foundSheet: true,
+          columnMap: resolveColumnMapFromRow(STANDARD_TEMPLATE_HEADERS).columnMap,
+          records: [],
+        };
+      });
+    });
+    setAvailableSheets(newCategories.map((c) => c.sheetName));
+    setLastSyncedAt(new Date().toISOString());
   };
 
   const handleResetColors = () => {
@@ -784,9 +844,12 @@ export default function App() {
     return categoryResults.filter((r) => !r.foundSheet);
   }, [categoryResults]);
 
+  const driveUserLabel =
+    driveConnection.user?.emailAddress || driveConnection.user?.displayName || null;
+
   return (
     <div className="min-h-screen flex flex-col bg-slate-50 text-slate-900">
-      {/* Top Bar following 3-Zone Contract */}
+      {/* Top Bar */}
       <Navbar
         activeTab={activeTab}
         onSelectTab={(tab) => {
@@ -796,24 +859,42 @@ export default function App() {
           }
         }}
         onOpenSettings={() => setIsSettingsOpen(true)}
-        isConnected={Boolean(spreadsheetId) && !dataError}
-        spreadsheetTitle={spreadsheetTitle}
-        userEmail={userEmail}
-        isAuthenticated={isLoggedIn}
-        hasDriveToken={hasDriveToken}
-        cloudSyncStatus={cloudSyncStatus}
-        lastCloudSavedAt={lastCloudSavedAt}
-        onRequestGoogleLogin={handleGoogleLogin}
-        onSaveToCloudDrive={() => handleSaveToCloudDrive(undefined, true)}
-        onLogout={handleLogout}
+        onOpenDriveModal={() => setIsDriveModalOpen(true)}
+        isDriveConnected={driveConnection.connected}
+        driveUserLabel={driveUserLabel}
+        isDriveUploading={isDriveUploading}
+        onConnectOrSaveDrive={() => {
+          if (driveConnection.connected) {
+            handleQuickSaveToGoogleDrive('xlsx');
+          } else {
+            handleConnectGoogleDrive();
+          }
+        }}
       />
 
       {/* Main Content Container */}
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 py-8 space-y-6">
-        {/* State 1: No Data Imported Yet -> Show Excel Template Import & Google Drive Hub */}
+        {/* Storage Quota Warning (if any) */}
+        {storageWarning && (
+          <div className="bg-amber-50 border-2 border-amber-400 rounded-xl px-4 py-3 flex items-center justify-between gap-3 text-xs text-amber-950">
+            <div className="flex items-center gap-2 font-semibold">
+              <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
+              <span>{storageWarning}</span>
+            </div>
+            <button
+              type="button"
+              onClick={() => setIsDriveModalOpen(true)}
+              className="px-3 py-1.5 font-bold text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg cursor-pointer shrink-0"
+            >
+              Save to Google Drive
+            </button>
+          </div>
+        )}
+
+        {/* State 1: No Data Imported Yet -> Show Excel Template Import & Sheets Hub */}
         {!spreadsheetId ? (
           <div className="max-w-4xl mx-auto space-y-6 my-4">
-            <div className="bg-white border border-slate-200 rounded-2xl p-6 sm:p-8 space-y-6">
+            <div className="bg-white border-2 border-slate-300 rounded-2xl p-6 sm:p-8 space-y-6">
               {/* Header */}
               <div className="flex flex-wrap items-start justify-between gap-4 border-b border-slate-100 pb-5">
                 <div className="flex items-start gap-3.5">
@@ -825,39 +906,22 @@ export default function App() {
                       นำเข้าข้อมูลการจองโต๊ะจากแม่แบบ Excel (VIP & Standard)
                     </h1>
                     <p className="text-xs sm:text-sm text-slate-500 mt-1">
-                      อัปโหลดไฟล์แม่แบบ Excel (.xlsx / .xls / .csv) หรือเข้าสู่ระบบ Google Drive เพื่อซิงค์ข้อมูลข้ามอุปกรณ์อัตโนมัติ
+                      อัปโหลดไฟล์แม่แบบ Excel (.xlsx / .xls / .csv) หรือเชื่อมต่อ Google Drive เพื่อบันทึกและกู้คืนข้อมูล
                     </p>
                   </div>
                 </div>
 
-                {isLoggedIn && userEmail && (
-                  <div className="flex items-center gap-2 text-xs text-slate-600 bg-slate-50 px-3 py-1.5 rounded-lg border border-slate-200">
-                    <CloudCheck className="w-4 h-4 text-emerald-600" />
-                    <span>เข้าสู่ระบบถาวร: {userEmail}</span>
-                    <button
-                      type="button"
-                      onClick={() => handleLoadFromCloudDrive(true)}
-                      disabled={cloudSyncStatus === 'loading'}
-                      className="inline-flex items-center gap-1 px-2 py-0.5 text-emerald-700 bg-emerald-50 hover:bg-emerald-100 rounded border border-emerald-200 font-semibold cursor-pointer"
-                    >
-                      <RefreshCw
-                        className={`w-3 h-3 ${cloudSyncStatus === 'loading' ? 'animate-spin' : ''}`}
-                      />
-                      ดึงข้อมูลจาก Cloud
-                    </button>
-                    <button
-                      type="button"
-                      onClick={handleLogout}
-                      className="inline-flex items-center gap-1 text-slate-500 hover:text-red-600 cursor-pointer"
-                    >
-                      <LogOut className="w-3.5 h-3.5" />
-                      ออกจากระบบ
-                    </button>
-                  </div>
-                )}
+                <button
+                  type="button"
+                  onClick={() => setIsDriveModalOpen(true)}
+                  className="inline-flex items-center gap-2 px-4 py-2 text-xs font-bold text-white bg-blue-600 hover:bg-blue-700 rounded-xl cursor-pointer"
+                >
+                  <Cloud className="w-4 h-4" />
+                  Google Drive Settings
+                </button>
               </div>
 
-              {/* Section 1: Excel (.xlsx / .xls) Multi-Sheet Template Importer */}
+              {/* Section 1: Excel Multi-Sheet Template Importer */}
               <ExcelTemplateImporter
                 categories={categories}
                 isSubmitting={isLoadingData}
@@ -865,20 +929,17 @@ export default function App() {
                 onLoadDefaultTemplate={handleLoadDefaultTemplate}
               />
 
-              {/* Section 2: Select Template File from Google Drive ("Shared with me" / "All") */}
+              {/* Section 2: Import Existing Google Sheet */}
               <div className="space-y-4 pt-2 border-t border-slate-100">
                 <div className="flex flex-wrap items-center justify-between gap-3">
                   <div>
                     <h2 className="text-sm font-bold text-slate-900 flex items-center gap-2">
-                      <Cloud className="w-4 h-4 text-emerald-600" />
-                      เชื่อมต่อ Google Drive เพื่อบันทึกข้อมูลบนคลาวด์ หรือเลือกไฟล์ Google Sheets
+                      <FileSpreadsheet className="w-4 h-4 text-emerald-600" />
+                      นำเข้าข้อมูลจากไฟล์ Google Sheets ที่มีอยู่แล้ว
                     </h2>
-                    <p className="text-xs text-slate-500 mt-0.5">
-                      เมื่อเข้าสู่ระบบ Google Drive ข้อมูลการจองและรายจ่ายทั้งหมดจะถูกบันทึกไว้ในเมลของคุณ เปิดจากเครื่องไหนก็ได้ข้อมูลครบถ้วน
-                    </p>
                   </div>
 
-                  {hasDriveToken && (
+                  {hasLegacySheetToken && (
                     <div className="flex items-center gap-1 p-1 bg-slate-100 rounded-lg">
                       <button
                         type="button"
@@ -890,7 +951,7 @@ export default function App() {
                         }`}
                       >
                         <Share2 className="w-3.5 h-3.5" />
-                        แชร์กับฉัน (Shared with me)
+                        แชร์กับฉัน
                       </button>
                       <button
                         type="button"
@@ -914,56 +975,18 @@ export default function App() {
                   </div>
                 )}
 
-                {!hasDriveToken ? (
-                  <div className="p-6 bg-slate-50 border border-slate-200 rounded-xl flex flex-col sm:flex-row items-center justify-between gap-4">
-                    <div className="space-y-1 text-center sm:text-left">
-                      <p className="text-sm font-semibold text-slate-800">
-                        เข้าสู่ระบบด้วยบัญชี Google เพื่อบันทึกและดึงข้อมูลจาก Google Drive อัตโนมัติ
-                      </p>
-                      <p className="text-xs text-slate-500">
-                        ข้อมูลการจองโต๊ะทุกโซนและรายจ่ายหลังบ้านจะถูกผูกไว้กับ Google Drive ของเมลคุณ เปิดใช้งานได้ทุกที่ทุกอุปกรณ์
-                      </p>
-                    </div>
-
-                    {/* Official Google Sign-In Material Button */}
+                {!hasLegacySheetToken ? (
+                  <div className="p-5 bg-slate-50 border border-slate-200 rounded-xl flex flex-col sm:flex-row items-center justify-between gap-4">
+                    <p className="text-xs text-slate-600">
+                      เข้าสู่ระบบ Google เพื่อเลือกไฟล์ Google Sheets ที่มีอยู่แล้วใน Drive มาเปิดใช้งาน
+                    </p>
                     <button
                       type="button"
-                      onClick={handleGoogleLogin}
-                      disabled={isLoggingIn}
-                      className="gsi-material-button shrink-0"
+                      onClick={handleLegacySheetsLogin}
+                      disabled={isLoggingInSheets}
+                      className="px-4 py-2 text-xs font-bold text-white bg-slate-900 hover:bg-slate-800 rounded-xl cursor-pointer shrink-0"
                     >
-                      <div className="gsi-material-button-state"></div>
-                      <div className="gsi-material-button-content-wrapper">
-                        <div className="gsi-material-button-icon">
-                          <svg
-                            version="1.1"
-                            xmlns="http://www.w3.org/2000/svg"
-                            viewBox="0 0 48 48"
-                            style={{ display: 'block' }}
-                          >
-                            <path
-                              fill="#EA4335"
-                              d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"
-                            ></path>
-                            <path
-                              fill="#4285F4"
-                              d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"
-                            ></path>
-                            <path
-                              fill="#FBBC05"
-                              d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"
-                            ></path>
-                            <path
-                              fill="#34A853"
-                              d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"
-                            ></path>
-                            <path fill="none" d="M0 0h48v48H0z"></path>
-                          </svg>
-                        </div>
-                        <span className="gsi-material-button-contents">
-                          {isLoggingIn ? 'กำลังเชื่อมต่อ...' : 'Sign in with Google'}
-                        </span>
-                      </div>
+                      {isLoggingInSheets ? 'กำลังเชื่อมต่อ...' : 'เชื่อมต่อ Google Sheets'}
                     </button>
                   </div>
                 ) : (
@@ -1001,21 +1024,8 @@ export default function App() {
                         กำลังดึงรายการไฟล์จาก Google Drive...
                       </div>
                     ) : driveFiles.length === 0 ? (
-                      <div className="py-8 text-center text-xs text-slate-500 bg-slate-50 rounded-xl border border-slate-200 space-y-2">
-                        <p>
-                          {driveFilter === 'sharedWithMe'
-                            ? 'ไม่พบไฟล์ Google Sheets ในหมวด "แชร์กับฉัน"'
-                            : 'ไม่พบไฟล์ Google Sheets ในรายการ'}
-                        </p>
-                        {driveFilter === 'sharedWithMe' && (
-                          <button
-                            type="button"
-                            onClick={() => setDriveFilter('all')}
-                            className="text-xs font-semibold text-blue-600 hover:underline cursor-pointer"
-                          >
-                            ดูไฟล์ Google Sheets ทั้งหมดใน Drive ของคุณ
-                          </button>
-                        )}
+                      <div className="py-8 text-center text-xs text-slate-500 bg-slate-50 rounded-xl border border-slate-200">
+                        ไม่พบไฟล์ Google Sheets ในรายการ
                       </div>
                     ) : (
                       <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 max-h-80 overflow-y-auto">
@@ -1051,94 +1061,128 @@ export default function App() {
             </div>
           </div>
         ) : (
-          /* State 2: Connected to Excel Template or Spreadsheet — Main Operational Console */
+          /* State 2: Main Operational Console */
           <>
-            {/* Compact Google Drive Cloud Sync Status Bar */}
+            {/* Real Google Drive Integration Bar */}
             <div className="bg-white border-2 border-slate-300 rounded-xl px-4 py-2.5 flex flex-wrap items-center justify-between gap-3 shadow-xs">
-              <div className="flex flex-wrap items-center gap-2.5 text-xs">
-                {isLoggedIn && userEmail ? (
-                  <>
-                    <span className="inline-flex items-center gap-1.5 font-bold text-emerald-700 bg-emerald-50 border border-emerald-200 px-2.5 py-1 rounded-md">
-                      <CloudCheck className="w-3.5 h-3.5" />
-                      เข้าสู่ระบบถาวร: {userEmail}
-                    </span>
-                    {cloudSyncStatus === 'saving' && (
-                      <span className="inline-flex items-center gap-1 text-blue-600 font-semibold">
-                        <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                        กำลังบันทึกข้อมูลลง Google Drive...
-                      </span>
-                    )}
-                    {cloudSyncStatus === 'loading' && (
-                      <span className="inline-flex items-center gap-1 text-blue-600 font-semibold">
-                        <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                        กำลังดึงข้อมูลจาก Google Drive...
-                      </span>
-                    )}
-                    {cloudSyncStatus === 'saved' && lastCloudSavedAt ? (
-                      <span className="text-slate-500">
-                        บันทึกล่าสุดบน Drive เมื่อ{' '}
-                        {new Date(lastCloudSavedAt).toLocaleTimeString('th-TH', {
-                          hour: '2-digit',
-                          minute: '2-digit',
-                          second: '2-digit',
-                        })}{' '}
-                        (เปิดจากเครื่องไหนก็ได้ข้อมูลตรงกัน)
-                      </span>
-                    ) : (
-                      <span className="text-slate-500">
-                        จดจำสถานะล็อกอินไว้ถาวรจนกว่าจะกดออกจากระบบเอง · บันทึกข้อมูลอัตโนมัติพร้อมซิงค์ Google Drive
-                      </span>
-                    )}
-                    {cloudError && (
-                      <span className="text-red-600 font-semibold">{cloudError}</span>
-                    )}
-                  </>
+              <div className="flex flex-wrap items-center gap-2.5 text-xs min-w-0 flex-1">
+                {driveConnection.connected ? (
+                  <span className="inline-flex items-center gap-1.5 font-bold text-emerald-700 bg-emerald-50 border border-emerald-200 px-2.5 py-1 rounded-md shrink-0">
+                    <CheckCircle2 className="w-3.5 h-3.5" />
+                    Google Drive Connected
+                    {driveUserLabel ? `: ${driveUserLabel}` : ''}
+                  </span>
                 ) : (
-                  <span className="inline-flex items-center gap-1.5 text-amber-800 font-medium">
-                    <Cloud className="w-4 h-4 text-amber-600" />
-                    ขณะนี้ออกจากระบบอยู่ — กดเข้าสู่ระบบเพื่อจดจำบัญชีอีเมลไว้แบบถาวรและซิงค์ข้อมูลกับ Google Drive
+                  <span className="inline-flex items-center gap-1.5 font-bold text-slate-700 bg-slate-100 border border-slate-200 px-2.5 py-1 rounded-md shrink-0">
+                    <Cloud className="w-3.5 h-3.5 text-slate-500" />
+                    Google Drive: Not Connected
+                  </span>
+                )}
+
+                {isDriveUploading && (
+                  <span className="inline-flex items-center gap-1.5 text-blue-700 font-bold">
+                    <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                    กำลังอัปโหลดไฟล์ไปยัง Google Drive...
+                  </span>
+                )}
+
+                {!isDriveUploading && lastDriveFile && (
+                  <span className="inline-flex flex-wrap items-center gap-2 text-emerald-800 font-semibold">
+                    <span>บันทึกขึ้น Drive แล้ว: {lastDriveFile.name}</span>
+                    <a
+                      href={lastDriveFile.webViewLink}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-emerald-100 hover:bg-emerald-200 text-emerald-900 font-bold transition-colors"
+                    >
+                      <ExternalLink className="w-3 h-3" />
+                      Open in Google Drive
+                    </a>
+                  </span>
+                )}
+
+                {!isDriveUploading && !lastDriveFile && !driveError && (
+                  <span className="text-slate-500">
+                    {driveConnection.connected
+                      ? 'กดปุ่ม Save to Google Drive เพื่ออัปโหลดไฟล์ Excel (.xlsx) หรือ JSON Backup ไปยัง Google Drive ของคุณ'
+                      : 'ตั้งค่า OAuth Client ID และกด Connect Google Drive เพื่อบันทึกไฟล์ตรงไปยัง Google Drive'}
                   </span>
                 )}
               </div>
 
-              <div className="flex flex-wrap items-center gap-2">
-                {isLoggedIn ? (
-                  <>
-                    <button
-                      type="button"
-                      onClick={() => handleSaveToCloudDrive(undefined, true)}
-                      disabled={cloudSyncStatus === 'saving'}
-                      className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg transition-colors cursor-pointer disabled:opacity-60"
-                    >
+              <div className="flex flex-wrap items-center gap-2 shrink-0">
+                <button
+                  type="button"
+                  onClick={() => setIsDriveModalOpen(true)}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold text-slate-700 bg-slate-100 hover:bg-slate-200 border border-slate-300 rounded-lg transition-colors cursor-pointer"
+                >
+                  <Settings className="w-3.5 h-3.5" />
+                  Google Drive Settings
+                </button>
+
+                {driveConnection.connected ? (
+                  <button
+                    type="button"
+                    onClick={() => handleQuickSaveToGoogleDrive('xlsx')}
+                    disabled={isDriveUploading}
+                    className="inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-bold text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg transition-colors cursor-pointer disabled:opacity-60"
+                  >
+                    {isDriveUploading ? (
+                      <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                    ) : (
                       <CloudUpload className="w-3.5 h-3.5" />
-                      บันทึกขึ้น Google Drive
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => handleLoadFromCloudDrive(true)}
-                      disabled={cloudSyncStatus === 'loading'}
-                      className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-lg transition-colors cursor-pointer disabled:opacity-60"
-                    >
-                      <RefreshCw
-                        className={`w-3.5 h-3.5 ${
-                          cloudSyncStatus === 'loading' ? 'animate-spin' : ''
-                        }`}
-                      />
-                      ดึงข้อมูลจาก Drive
-                    </button>
-                  </>
+                    )}
+                    {isDriveUploading ? 'Uploading...' : 'Save to Google Drive'}
+                  </button>
                 ) : (
                   <button
                     type="button"
-                    onClick={handleGoogleLogin}
-                    className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-700 rounded-lg transition-colors cursor-pointer"
+                    onClick={handleConnectGoogleDrive}
+                    disabled={isDriveConnecting}
+                    className="inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-bold text-white bg-blue-600 hover:bg-blue-700 rounded-lg transition-colors cursor-pointer disabled:opacity-60"
                   >
-                    <Cloud className="w-3.5 h-3.5" />
-                    เข้าสู่ระบบ Google (จดจำถาวร)
+                    {isDriveConnecting ? (
+                      <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                    ) : (
+                      <Cloud className="w-3.5 h-3.5" />
+                    )}
+                    {isDriveConnecting ? 'Connecting...' : 'Connect Google Drive'}
                   </button>
                 )}
               </div>
             </div>
+
+            {/* Real Google Drive API / GIS Error Banner (if any) */}
+            {driveError && (
+              <div className="bg-red-50 border-2 border-red-300 rounded-xl px-4 py-3 flex items-start justify-between gap-3 text-xs text-red-900">
+                <div className="flex items-start gap-2.5 min-w-0">
+                  <AlertCircle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
+                  <div className="space-y-0.5">
+                    <p className="font-extrabold text-red-800">
+                      Google Drive Error
+                    </p>
+                    <p className="font-medium break-words">{driveError}</p>
+                  </div>
+                </div>
+                <div className="flex items-center gap-2 shrink-0">
+                  <button
+                    type="button"
+                    onClick={() => setIsDriveModalOpen(true)}
+                    className="px-2.5 py-1 font-bold text-red-800 bg-white hover:bg-red-100 border border-red-300 rounded-lg cursor-pointer"
+                  >
+                    Open Drive Settings
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setDriveError(null)}
+                    aria-label="Dismiss error"
+                    className="p-1 text-red-500 hover:text-red-800 cursor-pointer"
+                  >
+                    <X className="w-4 h-4" />
+                  </button>
+                </div>
+              </div>
+            )}
 
             {/* Connection Context & Error Recovery Banner (if any) */}
             {dataError && (
@@ -1181,7 +1225,7 @@ export default function App() {
               </div>
             )}
 
-            {/* Warning if some configured sheets (e.g. VIP or Standard) were not found */}
+            {/* Warning if some configured sheets were not found */}
             {!dataError && !isLoadingData && missingSheetWarnings.length > 0 && (
               <div className="bg-amber-50 border border-amber-200 rounded-xl p-4 flex flex-wrap items-center justify-between gap-4">
                 <div className="flex items-start gap-3">
@@ -1216,15 +1260,13 @@ export default function App() {
                 categories={categories}
                 isLoading={isLoadingData}
                 onRefresh={() => {
-                  if (hasDriveToken) {
-                    handleLoadFromCloudDrive(true);
-                  } else if (spreadsheetId === 'template-import') {
+                  if (spreadsheetId === 'template-import') {
                     setIsSettingsOpen(true);
                   } else {
                     loadSheetData(spreadsheetId, categories);
                   }
                 }}
-                lastSyncedAt={lastCloudSavedAt || lastSyncedAt}
+                lastSyncedAt={lastDriveFile?.modifiedTime || lastSyncedAt}
                 onUpdateRecord={handleUpdateRecord}
                 onDeleteRecord={handleDeleteRecord}
                 onAddRecord={handleAddRecord}
@@ -1240,9 +1282,7 @@ export default function App() {
                 expenses={expenses}
                 isLoading={isLoadingData}
                 onRefresh={() => {
-                  if (hasDriveToken) {
-                    handleLoadFromCloudDrive(true);
-                  } else if (spreadsheetId === 'template-import') {
+                  if (spreadsheetId === 'template-import') {
                     setIsSettingsOpen(true);
                   } else {
                     loadSheetData(spreadsheetId, categories);
@@ -1287,18 +1327,14 @@ export default function App() {
                 onAddMultipleRecords={handleAddMultipleRecords}
                 onDeleteRecord={handleDeleteRecord}
                 onExportExcel={handleExportExcel}
-                isAuthenticated={isLoggedIn}
-                hasDriveToken={hasDriveToken}
-                userEmail={userEmail}
-                cloudSyncStatus={cloudSyncStatus}
-                lastCloudSavedAt={lastCloudSavedAt}
-                cloudError={cloudError}
-                syncedGoogleSheetUrl={syncedGoogleSheetUrl}
-                onRequestGoogleLogin={handleGoogleLogin}
-                onSaveToCloudDrive={() => handleSaveToCloudDrive(undefined, true)}
-                onLoadFromCloudDrive={() => handleLoadFromCloudDrive(true)}
-                onExportToGoogleSheet={handleExportToGoogleSheet}
-                onLogout={handleLogout}
+                driveConnection={driveConnection}
+                isDriveConnecting={isDriveConnecting}
+                isDriveUploading={isDriveUploading}
+                driveError={driveError}
+                lastDriveFile={lastDriveFile}
+                onOpenDriveModal={() => setIsDriveModalOpen(true)}
+                onConnectGoogleDrive={handleConnectGoogleDrive}
+                onQuickSaveToDrive={handleQuickSaveToGoogleDrive}
               />
             )}
           </>
@@ -1310,7 +1346,7 @@ export default function App() {
         <div className="max-w-7xl mx-auto flex flex-wrap items-center justify-between gap-4 text-xs text-slate-500">
           <div className="flex flex-wrap items-center gap-3">
             <span className="font-semibold text-slate-700">
-              VIP & Standard Seat Booking Lookup System
+              VIP &amp; Standard Seat Booking Lookup System
             </span>
             {spreadsheetTitle && (
               <>
@@ -1339,30 +1375,14 @@ export default function App() {
             >
               นำเข้าแม่แบบ Excel / เปลี่ยนไฟล์
             </button>
-            {isLoggedIn && userEmail ? (
-              <>
-                <span aria-hidden="true">·</span>
-                <span className="font-medium text-emerald-700">บัญชีถาวร: {userEmail}</span>
-                <button
-                  type="button"
-                  onClick={handleLogout}
-                  className="text-slate-600 hover:text-red-600 font-medium cursor-pointer"
-                >
-                  ออกจากระบบ
-                </button>
-              </>
-            ) : (
-              <>
-                <span aria-hidden="true">·</span>
-                <button
-                  type="button"
-                  onClick={handleGoogleLogin}
-                  className="text-blue-600 hover:underline font-medium cursor-pointer"
-                >
-                  เข้าสู่ระบบ Google (จดจำถาวร)
-                </button>
-              </>
-            )}
+            <span aria-hidden="true">·</span>
+            <button
+              type="button"
+              onClick={() => setIsDriveModalOpen(true)}
+              className="text-blue-700 hover:underline font-semibold cursor-pointer"
+            >
+              Google Drive Settings
+            </button>
           </div>
         </div>
       </footer>
@@ -1380,8 +1400,26 @@ export default function App() {
         onImportTemplateFiles={handleImportTemplateFiles}
         onLoadDefaultTemplate={handleLoadDefaultTemplate}
         onResetColors={handleResetColors}
-        isAuthenticated={hasDriveToken}
-        onRequestGoogleLogin={handleGoogleLogin}
+        isAuthenticated={hasLegacySheetToken}
+        onRequestGoogleLogin={handleLegacySheetsLogin}
+      />
+
+      {/* Real Google Drive GIS Settings & Upload Modal */}
+      <GoogleDriveModal
+        isOpen={isDriveModalOpen}
+        onClose={() => setIsDriveModalOpen(false)}
+        categories={categories}
+        categoryResults={categoryResults}
+        expenses={expenses}
+        spreadsheetTitle={spreadsheetTitle}
+        availableSheets={availableSheets}
+        connectionState={driveConnection}
+        lastUploadedFile={lastDriveFile}
+        onUploadSuccess={(file) => {
+          setLastDriveFile(file);
+          setDriveError(null);
+        }}
+        onRestoreCloudState={handleRestoreFromGoogleDrive}
       />
     </div>
   );

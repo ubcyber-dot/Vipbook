@@ -22,6 +22,7 @@ import {
 } from 'lucide-react';
 import { SeatRecord } from '../types/booking';
 import { buildUpdatedSeatRecord } from '../utils/excelTemplate';
+import { compressImageFileToDataUrl, sanitizeSafeUrl } from '../utils/media';
 import {
   SlipPreviewModal,
   resolveSlipImageCandidates,
@@ -152,8 +153,8 @@ export const BookingCard: React.FC<BookingCardProps> = ({
       transferAmount: Number.isFinite(numericAmount) ? Math.max(0, numericAmount) : 0,
       rawTransferAmount: transferAmountStr.trim(),
       transferDate: transferDate.trim(),
-      slipUrl: slipUrl.trim(),
-      slipUrl2: slipUrl2.trim(),
+      slipUrl: sanitizeSafeUrl(slipUrl),
+      slipUrl2: sanitizeSafeUrl(slipUrl2),
       isPaid,
       isCheckedIn,
       checkedInAt: finalCheckedInAt,
@@ -247,62 +248,66 @@ export const BookingCard: React.FC<BookingCardProps> = ({
     window.setTimeout(() => setSavedNotice(false), 2000);
   };
 
-  const handleSlipImageUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleSlipImageUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
-    const reader = new FileReader();
-    reader.onload = () => {
-      if (typeof reader.result === 'string') {
-        setSlipUrl(reader.result);
-      }
-    };
-    reader.readAsDataURL(file);
+    try {
+      const dataUrl = await compressImageFileToDataUrl(file);
+      setSlipUrl(dataUrl);
+    } catch (err) {
+      console.error('Failed to process slip 1 image:', err);
+    } finally {
+      e.target.value = '';
+    }
   };
 
-  const handleSlip2ImageUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleSlip2ImageUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
-    const reader = new FileReader();
-    reader.onload = () => {
-      if (typeof reader.result === 'string') {
-        setSlipUrl2(reader.result);
-      }
-    };
-    reader.readAsDataURL(file);
+    try {
+      const dataUrl = await compressImageFileToDataUrl(file);
+      setSlipUrl2(dataUrl);
+    } catch (err) {
+      console.error('Failed to process slip 2 image:', err);
+    } finally {
+      e.target.value = '';
+    }
   };
 
-  const handleQuickAttachSlip = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleQuickAttachSlip = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file || !onUpdateRecord) return;
-    const reader = new FileReader();
-    reader.onload = () => {
-      if (typeof reader.result === 'string') {
-        const updated = buildUpdatedSeatRecord(record, {
-          slipUrl: reader.result,
-        });
-        onUpdateRecord(updated);
-        setSavedNotice(true);
-        window.setTimeout(() => setSavedNotice(false), 2000);
-      }
-    };
-    reader.readAsDataURL(file);
+    try {
+      const dataUrl = await compressImageFileToDataUrl(file);
+      const updated = buildUpdatedSeatRecord(record, {
+        slipUrl: dataUrl,
+      });
+      onUpdateRecord(updated);
+      setSavedNotice(true);
+      window.setTimeout(() => setSavedNotice(false), 2000);
+    } catch (err) {
+      console.error('Failed to attach slip 1 image:', err);
+    } finally {
+      e.target.value = '';
+    }
   };
 
-  const handleQuickAttachSlip2 = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleQuickAttachSlip2 = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file || !onUpdateRecord) return;
-    const reader = new FileReader();
-    reader.onload = () => {
-      if (typeof reader.result === 'string') {
-        const updated = buildUpdatedSeatRecord(record, {
-          slipUrl2: reader.result,
-        });
-        onUpdateRecord(updated);
-        setSavedNotice(true);
-        window.setTimeout(() => setSavedNotice(false), 2000);
-      }
-    };
-    reader.readAsDataURL(file);
+    try {
+      const dataUrl = await compressImageFileToDataUrl(file);
+      const updated = buildUpdatedSeatRecord(record, {
+        slipUrl2: dataUrl,
+      });
+      onUpdateRecord(updated);
+      setSavedNotice(true);
+      window.setTimeout(() => setSavedNotice(false), 2000);
+    } catch (err) {
+      console.error('Failed to attach slip 2 image:', err);
+    } finally {
+      e.target.value = '';
+    }
   };
 
   return (

@@ -14,6 +14,7 @@ import {
   AlertCircle,
   Eye,
 } from 'lucide-react';
+import { compressImageFileToDataUrl, sanitizeSafeUrl } from '../utils/media';
 
 export interface SlipPreviewData {
   slipUrl: string;
@@ -103,21 +104,27 @@ export const SlipPreviewModal: React.FC<SlipPreviewModalProps> = ({
   const [rotation, setRotation] = useState<number>(0);
   const [imgStage, setImgStage] = useState<'primary' | 'fallback' | 'iframe' | 'error'>('primary');
 
-  const candidates = useMemo(
-    () => resolveSlipImageCandidates(preview?.slipUrl || ''),
+  const safeSlipUrl = useMemo(
+    () => sanitizeSafeUrl(preview?.slipUrl || ''),
     [preview?.slipUrl]
+  );
+
+  const candidates = useMemo(
+    () => resolveSlipImageCandidates(safeSlipUrl),
+    [safeSlipUrl]
   );
 
   useEffect(() => {
     setZoom(1);
     setRotation(0);
     setImgStage('primary');
-  }, [preview?.slipUrl]);
+  }, [safeSlipUrl]);
 
   useEffect(() => {
     if (!preview) return;
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
+        e.stopImmediatePropagation();
         e.stopPropagation();
         onClose();
       }
@@ -126,7 +133,7 @@ export const SlipPreviewModal: React.FC<SlipPreviewModalProps> = ({
     return () => window.removeEventListener('keydown', handleKeyDown, true);
   }, [preview, onClose]);
 
-  if (!preview || !preview.slipUrl) return null;
+  if (!preview || !safeSlipUrl) return null;
 
   const accentColor = preview.accentColor || '#1E293B';
   const currentImgSrc =
@@ -144,19 +151,20 @@ export const SlipPreviewModal: React.FC<SlipPreviewModalProps> = ({
     }
   };
 
-  const handleUploadReplacement = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleUploadReplacement = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file || !preview.onReplaceSlipUrl) return;
-    const reader = new FileReader();
-    reader.onload = () => {
-      if (typeof reader.result === 'string') {
-        preview.onReplaceSlipUrl?.(reader.result);
-      }
-    };
-    reader.readAsDataURL(file);
+    try {
+      const dataUrl = await compressImageFileToDataUrl(file);
+      preview.onReplaceSlipUrl(dataUrl);
+    } catch (err) {
+      console.error('Failed to process replacement slip image:', err);
+    } finally {
+      e.target.value = '';
+    }
   };
 
-  const isDataUrl = preview.slipUrl.startsWith('data:image/');
+  const isDataUrl = safeSlipUrl.startsWith('data:image/');
 
   return (
     <div
@@ -341,7 +349,7 @@ export const SlipPreviewModal: React.FC<SlipPreviewModalProps> = ({
               <div className="flex flex-wrap items-center justify-center gap-2 pt-2">
                 {!isDataUrl && (
                   <a
-                    href={preview.slipUrl}
+                    href={safeSlipUrl}
                     target="_blank"
                     rel="noopener noreferrer"
                     className="inline-flex items-center gap-1.5 px-4 py-2.5 text-xs font-bold text-white rounded-xl shadow-xs hover:opacity-90"
@@ -399,8 +407,8 @@ export const SlipPreviewModal: React.FC<SlipPreviewModalProps> = ({
 
             {isDataUrl ? (
               <a
-                href={preview.slipUrl}
-                download={`slip-${preview.title.replace(/\s+/g, '_')}.png`}
+                href={safeSlipUrl}
+                download={`slip-${preview.title.replace(/\s+/g, '_')}.jpg`}
                 className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-bold text-white bg-white/15 hover:bg-white/25 border border-white/25 rounded-xl transition-colors"
               >
                 <Download className="w-3.5 h-3.5" />
@@ -408,7 +416,7 @@ export const SlipPreviewModal: React.FC<SlipPreviewModalProps> = ({
               </a>
             ) : (
               <a
-                href={preview.slipUrl}
+                href={safeSlipUrl}
                 target="_blank"
                 rel="noopener noreferrer"
                 className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-bold text-white bg-white/15 hover:bg-white/25 border border-white/25 rounded-xl transition-colors"

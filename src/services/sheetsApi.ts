@@ -46,8 +46,11 @@ export interface CloudStateReadResponse {
 
 export interface CloudStateSaveResponse {
   saved: boolean;
+  savedToGoogleDrive?: boolean;
+  storageTarget?: 'google_drive' | 'server_local';
   fileId: string;
   fileName: string;
+  webViewLink?: string;
   modifiedTime: string;
 }
 

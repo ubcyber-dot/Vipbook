@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useEffect } from 'react';
+import React, { useState, useMemo, useEffect, useRef } from 'react';
 import {
   Search,
   X,
@@ -111,17 +111,27 @@ export const LookupView: React.FC<LookupViewProps> = ({
     return { exactMatches, partialMatches };
   }, [records, activeQuery]);
 
-  // Automatically open popup when user finishes typing an exact table number
+  const lastAutoOpenedQueryRef = useRef<string>('');
+
+  // Automatically open popup once when user finishes typing a new exact table number
   useEffect(() => {
-    if (!activeQuery.trim()) {
+    const trimmed = activeQuery.trim();
+    if (!trimmed) {
+      lastAutoOpenedQueryRef.current = '';
       setPopupRecordIds([]);
       setPopupNotFoundQuery(null);
       return;
     }
 
-    if (searchResult.exactMatches.length > 0) {
+    const normalizedKey = normalizeQuery(trimmed);
+    if (
+      searchResult.exactMatches.length > 0 &&
+      lastAutoOpenedQueryRef.current !== normalizedKey
+    ) {
+      const matchedIds = searchResult.exactMatches.map((r) => r.id);
       const timer = window.setTimeout(() => {
-        setPopupRecordIds(searchResult.exactMatches.map((r) => r.id));
+        lastAutoOpenedQueryRef.current = normalizedKey;
+        setPopupRecordIds(matchedIds);
         setPopupNotFoundQuery(null);
       }, 350);
       return () => window.clearTimeout(timer);

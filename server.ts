@@ -39,6 +39,10 @@ interface SheetColumnMap {
   transferDateIdx: number;
   slipUrlIdx: number;
   paidStatusIdx: number;
+  checkedInStatusIdx?: number;
+  checkedInAtIdx?: number;
+  ticketStatusIdx?: number;
+  ticketCollectedAtIdx?: number;
   noteIdx?: number;
   slipUrl2Idx?: number;
   headers: string[];
@@ -111,6 +115,28 @@ function evaluatePaidStatus(rawPaidValue: unknown): boolean {
   ]);
 
   return positiveValues.has(normalized);
+}
+
+function evaluateCheckedInStatus(rawVal: unknown): boolean {
+  if (typeof rawVal === 'boolean') return rawVal;
+  const normalized = String(rawVal ?? '').trim().toLowerCase();
+  if (!normalized) return false;
+  if (normalized.includes('ยังไม่') || normalized === 'false' || normalized === '0' || normalized === '-') {
+    return false;
+  }
+  const positive = new Set(['true', 'yes', 'เช็คอินแล้ว', 'เช็คอิน', 'เข้างานแล้ว', 'มาแล้ว', 'checkedin', 'checked-in', '1', '✓', '✔']);
+  return positive.has(normalized) || normalized.includes('เช็คอินแล้ว') || normalized.includes('เข้างานแล้ว');
+}
+
+function evaluateTicketCollectedStatus(rawVal: unknown): boolean {
+  if (typeof rawVal === 'boolean') return rawVal;
+  const normalized = String(rawVal ?? '').trim().toLowerCase();
+  if (!normalized) return false;
+  if (normalized.includes('ยังไม่') || normalized === 'false' || normalized === '0' || normalized === '-') {
+    return false;
+  }
+  const positive = new Set(['true', 'yes', 'รับบัตรแล้ว', 'รับบัตร', 'รับแล้ว', 'แจกบัตรแล้ว', 'collected', 'ticketed', '1', '✓', '✔']);
+  return positive.has(normalized) || normalized.includes('รับบัตรแล้ว') || normalized.includes('แจกบัตรแล้ว');
 }
 
 function parseTransferAmount(rawAmount: unknown): number {
@@ -186,6 +212,10 @@ function resolveColumnMapFromRow(headerRow: string[]): {
   const colE = findIndexByAliases(['วันที่โอน', 'เวลาโอน', 'วันเวลาโอน', 'วันที่ชำระ', 'วันที่', 'transferdate', 'date'], 4);
   const colF = findIndexByAliases(['ลิ้งค์สลีป', 'ลิงก์สลิป', 'ลิ้งค์สลิป', 'ลิงค์สลีป', 'ลิงค์สลิป', 'สลีป', 'สลิป', 'หลักฐานการโอน', 'หลักฐาน', 'slip', 'sliplink', 'slipurl'], 5);
   const colG = findIndexByAliases(['โอนแล้ว', 'สถานะการโอน', 'สถานะชำระเงิน', 'สถานะ', 'ชำระแล้ว', 'paid', 'status'], 6);
+  const colH = findIndexByAliases(['เช็คอินแล้ว', 'เช็คอิน', 'สถานะเช็คอิน', 'เข้างานแล้ว', 'checkin', 'checkedin'], 7);
+  const colI = findIndexByAliases(['เวลาเช็คอิน', 'วันเวลาเช็คอิน', 'checkintime', 'checkedinat'], 8);
+  const colJ = findIndexByAliases(['รับบัตรแล้ว', 'รับบัตร', 'สถานะรับบัตร', 'แจกบัตรแล้ว', 'ticketcollected', 'ticketstatus'], 9);
+  const colK = findIndexByAliases(['เวลารับบัตร', 'วันเวลารับบัตร', 'tickettime', 'ticketcollectedat'], 10);
   const colL = findIndexByAliases(['หมายเหตุ', 'บันทึก', 'บันทึกเพิ่มเติม', 'รายละเอียดเพิ่มเติม', 'note', 'notes', 'remark', 'remarks'], 11);
   const colM = findIndexByAliases(['ลิ้งค์สลีป2', 'ลิงก์สลิป2', 'ลิ้งค์สลิป2', 'ลิงค์สลีป2', 'สลิป2', 'สลีป2', 'สลิปที่2', 'สลีปที่2', 'หลักฐานการโอน2', 'หลักฐาน2', 'slip2', 'slipurl2', 'sliplink2'], 12);
 
@@ -200,6 +230,10 @@ function resolveColumnMapFromRow(headerRow: string[]): {
       transferDateIdx: colE.idx,
       slipUrlIdx: colF.idx,
       paidStatusIdx: colG.idx,
+      checkedInStatusIdx: colH.matched ? colH.idx : 7,
+      checkedInAtIdx: colI.matched ? colI.idx : 8,
+      ticketStatusIdx: colJ.matched ? colJ.idx : 9,
+      ticketCollectedAtIdx: colK.matched ? colK.idx : 10,
       noteIdx: colL.matched ? colL.idx : 11,
       slipUrl2Idx: colM.matched ? colM.idx : 12,
       headers: headerRow.map((h) => String(h ?? '').replace(/^\uFEFF/, '').trim()),
@@ -298,6 +332,23 @@ function parseSheetRowsToRecords(
     const rawPaidCell = row[columnMap.paidStatusIdx];
     const rawPaidStatus = String(rawPaidCell ?? '').trim();
     const isPaid = evaluatePaidStatus(rawPaidCell);
+
+    const rawCheckedInCell =
+      columnMap.checkedInStatusIdx !== undefined ? row[columnMap.checkedInStatusIdx] : '';
+    const isCheckedIn = evaluateCheckedInStatus(rawCheckedInCell);
+    const checkedInAt =
+      columnMap.checkedInAtIdx !== undefined
+        ? String(row[columnMap.checkedInAtIdx] ?? '').trim()
+        : '';
+
+    const rawTicketCell =
+      columnMap.ticketStatusIdx !== undefined ? row[columnMap.ticketStatusIdx] : '';
+    const isTicketCollected = evaluateTicketCollectedStatus(rawTicketCell);
+    const ticketCollectedAt =
+      columnMap.ticketCollectedAtIdx !== undefined
+        ? String(row[columnMap.ticketCollectedAtIdx] ?? '').trim()
+        : '';
+
     const rawNote =
       columnMap.noteIdx !== undefined
         ? String(row[columnMap.noteIdx] ?? '').trim()
@@ -319,7 +370,14 @@ function parseSheetRowsToRecords(
     const hasCustomerName =
       Boolean(fullName) && !['-', 'ว่าง', 'ไม่มี', 'empty', 'available'].includes(fullName.toLowerCase());
     const hasBookingData =
-      hasCustomerName || Boolean(phone && phone !== '-') || transferAmount > 0 || Boolean(slipUrl) || Boolean(slipUrl2) || isPaid;
+      hasCustomerName ||
+      Boolean(phone && phone !== '-') ||
+      transferAmount > 0 ||
+      Boolean(slipUrl) ||
+      Boolean(slipUrl2) ||
+      isPaid ||
+      isCheckedIn ||
+      isTicketCollected;
 
     records.push({
       id: `${cat.id}-row-${r + 1}-${normalizedTableNumber}`,
@@ -340,6 +398,10 @@ function parseSheetRowsToRecords(
       rawPaidStatus,
       isPaid,
       isBooked: hasBookingData,
+      isCheckedIn,
+      checkedInAt: checkedInAt === '-' ? '' : checkedInAt,
+      isTicketCollected,
+      ticketCollectedAt: ticketCollectedAt === '-' ? '' : ticketCollectedAt,
       note,
     });
   }
@@ -1110,8 +1172,13 @@ app.post('/api/drive/cloud-state', async (req: Request, res: Response) => {
           writeServerCloudState(email, statePayload, uploadData.id);
           res.json({
             saved: true,
+            savedToGoogleDrive: true,
+            storageTarget: 'google_drive',
             fileId: uploadData.id || localSaved.fileId,
             fileName: uploadData.name || CLOUD_STATE_FILENAME,
+            webViewLink: uploadData.id
+              ? `https://drive.google.com/file/d/${uploadData.id}/view`
+              : undefined,
             modifiedTime: uploadData.modifiedTime || localSaved.modifiedTime,
           });
           return;
@@ -1123,6 +1190,8 @@ app.post('/api/drive/cloud-state', async (req: Request, res: Response) => {
 
     res.json({
       saved: true,
+      savedToGoogleDrive: false,
+      storageTarget: 'server_local',
       fileId: localSaved.fileId,
       fileName: CLOUD_STATE_FILENAME,
       modifiedTime: localSaved.modifiedTime,
@@ -1258,7 +1327,7 @@ app.post('/api/drive/sync-google-sheet', async (req: Request, res: Response) => 
     const newSpreadsheetId = createdData.spreadsheetId;
 
     // Populate all sheet values via values:batchUpdate
-    await fetch(
+    const batchUpdateRes = await fetch(
       `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(
         newSpreadsheetId
       )}/values:batchUpdate`,
@@ -1277,6 +1346,16 @@ app.post('/api/drive/sync-google-sheet', async (req: Request, res: Response) => 
         }),
       }
     );
+
+    if (!batchUpdateRes.ok) {
+      const errData = await batchUpdateRes.json().catch(() => ({}));
+      res.status(batchUpdateRes.status).json({
+        error:
+          errData?.error?.message ||
+          'สร้างไฟล์ Google Sheets แล้วแต่ไม่สามารถเขียนข้อมูลลงแผ่นงานได้',
+      });
+      return;
+    }
 
     res.json({
       spreadsheetId: newSpreadsheetId,

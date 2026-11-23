@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import {
   Search,
   X,
@@ -61,6 +61,21 @@ export const SeatMapView: React.FC<SeatMapViewProps> = ({
   const [addModalCategoryId, setAddModalCategoryId] = useState<string | undefined>(
     undefined
   );
+
+  // Sync category filter whenever parent navigates to SeatMap for a specific zone
+  useEffect(() => {
+    setSelectedCategory(initialCategoryFilter);
+  }, [initialCategoryFilter]);
+
+  // Reset to 'all' if the currently selected category was deleted in Settings
+  useEffect(() => {
+    if (
+      selectedCategory !== 'all' &&
+      !categories.some((c) => c.id === selectedCategory)
+    ) {
+      setSelectedCategory('all');
+    }
+  }, [categories, selectedCategory]);
 
   const activeSeat = useMemo(
     () => records.find((r) => r.id === activeSeatId) || null,

@@ -16,14 +16,14 @@ import {
   RotateCcw,
   Armchair,
   Save,
-  X,
   Cloud,
+  CloudUpload,
   RefreshCw,
-  FileSpreadsheet,
+  Settings,
   Eye,
   UserCheck,
   Ticket,
-  LogOut,
+  AlertCircle,
 } from 'lucide-react';
 import {
   CategoryConfig,
@@ -35,9 +35,9 @@ import {
   EXPENSE_CATEGORY_OPTIONS,
   getExpenseCategoryLabel,
   buildUpdatedSeatRecord,
-  normalizeTableNo,
-  compactTableNo,
 } from '../utils/excelTemplate';
+import { compressImageFileToDataUrl, sanitizeSafeUrl } from '../utils/media';
+import { DriveConnectionState, DriveUploadedFile } from '../services/googleDriveGis';
 import { formatBaht, formatNowCheckInTimestamp } from './BookingCard';
 import { formatPercent } from './DashboardView';
 import { SeatDetailModal } from './SeatDetailModal';
@@ -56,18 +56,14 @@ interface BackOfficeViewProps {
   onAddMultipleRecords?: (categoryId: string, records: SeatRecord[]) => void;
   onDeleteRecord: (recordId: string) => void;
   onExportExcel: () => void;
-  isAuthenticated?: boolean;
-  hasDriveToken?: boolean;
-  userEmail?: string | null;
-  cloudSyncStatus?: 'idle' | 'saving' | 'saved' | 'loading' | 'error';
-  lastCloudSavedAt?: string | null;
-  cloudError?: string | null;
-  syncedGoogleSheetUrl?: string | null;
-  onRequestGoogleLogin?: () => void;
-  onSaveToCloudDrive?: () => void;
-  onLoadFromCloudDrive?: () => void;
-  onExportToGoogleSheet?: () => void;
-  onLogout?: () => void;
+  driveConnection: DriveConnectionState;
+  isDriveConnecting: boolean;
+  isDriveUploading: boolean;
+  driveError: string | null;
+  lastDriveFile: DriveUploadedFile | null;
+  onOpenDriveModal: () => void;
+  onConnectGoogleDrive: () => void;
+  onQuickSaveToDrive: (format: 'xlsx' | 'json') => void;
 }
 
 export const BackOfficeView: React.FC<BackOfficeViewProps> = ({
@@ -82,18 +78,14 @@ export const BackOfficeView: React.FC<BackOfficeViewProps> = ({
   onAddMultipleRecords,
   onDeleteRecord,
   onExportExcel,
-  isAuthenticated = false,
-  hasDriveToken = false,
-  userEmail,
-  cloudSyncStatus = 'idle',
-  lastCloudSavedAt,
-  cloudError,
-  syncedGoogleSheetUrl,
-  onRequestGoogleLogin,
-  onSaveToCloudDrive,
-  onLoadFromCloudDrive,
-  onExportToGoogleSheet,
-  onLogout,
+  driveConnection,
+  isDriveConnecting,
+  isDriveUploading,
+  driveError,
+  lastDriveFile,
+  onOpenDriveModal,
+  onConnectGoogleDrive,
+  onQuickSaveToDrive,
 }) => {
   const [subTab, setSubTab] = useState<'expenses' | 'bookings'>('expenses');
 
@@ -115,16 +107,6 @@ export const BackOfficeView: React.FC<BackOfficeViewProps> = ({
   >('all');
   const [tableSearch, setTableSearch] = useState('');
   const [isAddingTable, setIsAddingTable] = useState(false);
-  const [newTableCategoryId, setNewTableCategoryId] = useState<string>(
-    categories[0]?.id || 'vip'
-  );
-  const [newTableNumber, setNewTableNumber] = useState('');
-  const [newFullName, setNewFullName] = useState('');
-  const [newPhone, setNewPhone] = useState('');
-  const [newTransferAmountStr, setNewTransferAmountStr] = useState('');
-  const [newTransferDate, setNewTransferDate] = useState('');
-  const [newSlipUrl, setNewSlipUrl] = useState('');
-  const [newIsPaid, setNewIsPaid] = useState(false);
 
   // Popup Edit Modal State
   const [activeEditSeatId, setActiveEditSeatId] = useState<string | null>(null);
@@ -208,7 +190,8 @@ export const BackOfficeView: React.FC<BackOfficeViewProps> = ({
           r.compactTableNumber.includes(q.replace(/[\s\-_]+/g, ''));
         const matchName = r.fullName.toUpperCase().includes(q);
         const matchPhone = r.phone.toUpperCase().includes(q);
-        if (!matchTable && !matchName && !matchPhone) return false;
+        const matchNote = (r.note || '').toUpperCase().includes(q);
+        if (!matchTable && !matchName && !matchPhone && !matchNote) return false;
       }
       return true;
     });
@@ -243,7 +226,7 @@ export const BackOfficeView: React.FC<BackOfficeViewProps> = ({
           amount: numericAmount,
           expenseDate: expDate.trim() || new Date().toLocaleDateString('th-TH'),
           payeeOrNote: expPayee.trim(),
-          receiptUrl: expReceiptUrl.trim(),
+          receiptUrl: sanitizeSafeUrl(expReceiptUrl),
         });
       }
     } else {
@@ -254,7 +237,7 @@ export const BackOfficeView: React.FC<BackOfficeViewProps> = ({
         amount: numericAmount,
         expenseDate: expDate.trim() || new Date().toLocaleDateString('th-TH'),
         payeeOrNote: expPayee.trim(),
-        receiptUrl: expReceiptUrl.trim(),
+        receiptUrl: sanitizeSafeUrl(expReceiptUrl),
       });
     }
 
@@ -271,63 +254,17 @@ export const BackOfficeView: React.FC<BackOfficeViewProps> = ({
     setExpReceiptUrl(exp.receiptUrl);
   };
 
-  const handleExpenseReceiptUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleExpenseReceiptUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
-    const reader = new FileReader();
-    reader.onload = () => {
-      if (typeof reader.result === 'string') {
-        setExpReceiptUrl(reader.result);
-      }
-    };
-    reader.readAsDataURL(file);
-  };
-
-  const handleAddTableSubmit = (e: React.FormEvent) => {
-    e.preventDefault();
-    const trimmedTableNo = newTableNumber.trim();
-    if (!trimmedTableNo) return;
-
-    const targetCat =
-      categories.find((c) => c.id === newTableCategoryId) || categories[0];
-    if (!targetCat) return;
-
-    const catRecords = records.filter((r) => r.categoryId === targetCat.id);
-    const nextRowNum = catRecords.length + 2;
-    const amountVal = Number(String(newTransferAmountStr).replace(/[,฿\s]|บาท/gi, '').trim());
-    const validAmount = Number.isFinite(amountVal) ? Math.max(0, amountVal) : 0;
-
-    const baseRecord: SeatRecord = {
-      id: `${targetCat.id}-custom-${Date.now()}-${normalizeTableNo(trimmedTableNo)}`,
-      rowNumber: nextRowNum,
-      categoryId: targetCat.id,
-      categoryName: targetCat.name,
-      sheetName: targetCat.sheetName,
-      tableNumber: trimmedTableNo,
-      normalizedTableNumber: normalizeTableNo(trimmedTableNo),
-      compactTableNumber: compactTableNo(trimmedTableNo),
-      fullName: newFullName.trim(),
-      phone: newPhone.trim(),
-      transferAmount: validAmount,
-      rawTransferAmount: validAmount > 0 ? String(validAmount) : '',
-      transferDate: newTransferDate.trim(),
-      slipUrl: newSlipUrl.trim(),
-      rawPaidStatus: newIsPaid ? 'TRUE' : 'FALSE',
-      isPaid: newIsPaid,
-      isBooked: false,
-    };
-
-    const finalRecord = buildUpdatedSeatRecord(baseRecord, {});
-    onAddRecord(targetCat.id, finalRecord);
-
-    setNewTableNumber('');
-    setNewFullName('');
-    setNewPhone('');
-    setNewTransferAmountStr('');
-    setNewTransferDate('');
-    setNewSlipUrl('');
-    setNewIsPaid(false);
-    setIsAddingTable(false);
+    try {
+      const dataUrl = await compressImageFileToDataUrl(file);
+      setExpReceiptUrl(dataUrl);
+    } catch (err) {
+      console.error('Failed to process receipt image:', err);
+    } finally {
+      e.target.value = '';
+    }
   };
 
   return (
@@ -353,123 +290,115 @@ export const BackOfficeView: React.FC<BackOfficeViewProps> = ({
         </button>
       </div>
 
-      {/* Google Drive Cloud Persistence Banner */}
+      {/* Real Google Drive API v3 & GIS Integration Panel */}
       <section className="bg-white border-[2.5px] border-slate-300 rounded-2xl p-5 sm:p-6 flex flex-col lg:flex-row lg:items-center justify-between gap-4 shadow-xs">
-        <div className="flex items-start gap-3.5">
+        <div className="flex items-start gap-3.5 min-w-0 flex-1">
           <div
             className={`w-11 h-11 rounded-xl flex items-center justify-center shrink-0 ${
-              isAuthenticated
+              driveConnection.connected
                 ? 'bg-emerald-600 text-white'
-                : 'bg-slate-900 text-white'
+                : 'bg-blue-600 text-white'
             }`}
           >
             <Cloud className="w-5 h-5" />
           </div>
-          <div className="space-y-1">
+          <div className="space-y-1 min-w-0">
             <div className="flex flex-wrap items-center gap-2">
               <h2 className="text-sm sm:text-base font-bold text-slate-900">
-                ระบบจดจำการเข้าสู่ระบบถาวร &amp; บันทึกข้อมูลลง Google Drive อัตโนมัติ
+                Google Drive Integration (Real Google Drive API v3)
               </h2>
-              {isAuthenticated && userEmail && (
+              {driveConnection.connected ? (
                 <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-md text-xs font-bold bg-emerald-50 text-emerald-700 border border-emerald-200">
-                  <UserCheck className="w-3.5 h-3.5" />
-                  เข้าสู่ระบบถาวร: {userEmail}
+                  <CheckCircle2 className="w-3.5 h-3.5" />
+                  Connected
+                  {driveConnection.user?.emailAddress
+                    ? `: ${driveConnection.user.emailAddress}`
+                    : ''}
                 </span>
-              )}
-              {isAuthenticated && (
-                <span
-                  className={`px-2 py-0.5 rounded-md text-[11px] font-bold border ${
-                    hasDriveToken
-                      ? 'bg-sky-50 text-sky-700 border-sky-200'
-                      : 'bg-slate-100 text-slate-600 border-slate-200'
-                  }`}
-                >
-                  {hasDriveToken ? 'เชื่อมต่อ Google Drive พร้อมซิงค์' : 'พร้อมซิงค์เมื่อกดปุ่มด้านขวา'}
+              ) : (
+                <span className="px-2 py-0.5 rounded-md text-[11px] font-bold bg-amber-50 text-amber-800 border border-amber-200">
+                  Not Connected
                 </span>
               )}
             </div>
             <p className="text-xs text-slate-500">
-              {isAuthenticated
-                ? lastCloudSavedAt
-                  ? `ระบบจดจำบัญชีอีเมล ${userEmail} ไว้ถาวรจนกว่าจะกดออกจากระบบเอง · ซิงค์ลง Google Drive ล่าสุดเมื่อ ${new Date(
-                      lastCloudSavedAt
-                    ).toLocaleString('th-TH')}`
-                  : `ระบบจดจำบัญชีอีเมล ${userEmail} ไว้ถาวรจนกว่าคุณจะกดออกจากระบบเอง และบันทึกข้อมูลไว้พร้อมซิงค์กับไฟล์ Seat_Booking_System_CloudData.json บน Google Drive`
-                : 'เข้าสู่ระบบด้วยบัญชี Google เพื่อจดจำการล็อกอินไว้แบบถาวรและบันทึกข้อมูลการจองโต๊ะและรายจ่ายทั้งหมดไว้ใน Google Drive ของคุณ'}
+              {driveConnection.connected
+                ? 'เชื่อมต่อ Google Identity Services (scope: drive.file) เรียบร้อยแล้ว สามารถอัปโหลดไฟล์ Excel (.xlsx) หรือ JSON Backup ตรงไปยัง Google Drive root folder ของคุณได้ทันที'
+                : 'ตั้งค่า Google Cloud OAuth Client ID และกด Connect Google Drive เพื่ออัปโหลดไฟล์ Excel (.xlsx) หรือ JSON Backup ไปยัง Google Drive จริงของคุณ'}
             </p>
-            {cloudError && (
-              <p className="text-xs font-semibold text-red-600">{cloudError}</p>
+            {driveError && (
+              <p className="text-xs font-semibold text-red-600 flex items-center gap-1.5 pt-0.5">
+                <AlertCircle className="w-3.5 h-3.5 shrink-0" />
+                <span className="break-words">{driveError}</span>
+              </p>
             )}
-            {syncedGoogleSheetUrl && (
-              <a
-                href={syncedGoogleSheetUrl}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="inline-flex items-center gap-1.5 text-xs font-bold text-blue-600 hover:underline pt-1"
-              >
-                <ExternalLink className="w-3.5 h-3.5" />
-                เปิดไฟล์ Google Sheets ที่สร้างไว้ใน Google Drive
-              </a>
+            {lastDriveFile && (
+              <div className="pt-1 flex flex-wrap items-center gap-2 text-xs">
+                <span className="font-semibold text-emerald-700">
+                  บันทึกล่าสุด: {lastDriveFile.name}
+                </span>
+                <a
+                  href={lastDriveFile.webViewLink}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex items-center gap-1 font-bold text-blue-600 hover:underline"
+                >
+                  <ExternalLink className="w-3.5 h-3.5" />
+                  Open in Google Drive
+                </a>
+              </div>
             )}
           </div>
         </div>
 
         <div className="flex flex-wrap items-center gap-2 shrink-0">
-          {isAuthenticated ? (
+          <button
+            type="button"
+            onClick={onOpenDriveModal}
+            className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-bold text-slate-700 bg-slate-100 hover:bg-slate-200 border border-slate-300 rounded-xl transition-colors cursor-pointer"
+          >
+            <Settings className="w-3.5 h-3.5" />
+            Google Drive Settings
+          </button>
+
+          {driveConnection.connected ? (
             <>
               <button
                 type="button"
-                onClick={onSaveToCloudDrive}
-                disabled={cloudSyncStatus === 'saving'}
-                className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-bold text-white bg-slate-900 hover:bg-slate-800 rounded-xl transition-colors cursor-pointer disabled:opacity-60"
+                onClick={() => onQuickSaveToDrive('xlsx')}
+                disabled={isDriveUploading}
+                className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-bold text-white bg-emerald-600 hover:bg-emerald-700 rounded-xl transition-colors cursor-pointer disabled:opacity-60"
               >
-                <RefreshCw
-                  className={`w-3.5 h-3.5 ${
-                    cloudSyncStatus === 'saving' ? 'animate-spin' : ''
-                  }`}
-                />
-                {cloudSyncStatus === 'saving'
-                  ? 'กำลังบันทึก...'
-                  : 'บันทึกขึ้น Google Drive ทันที'}
+                {isDriveUploading ? (
+                  <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                ) : (
+                  <CloudUpload className="w-3.5 h-3.5" />
+                )}
+                {isDriveUploading ? 'Uploading...' : 'Save Excel to Google Drive'}
               </button>
               <button
                 type="button"
-                onClick={onLoadFromCloudDrive}
-                disabled={cloudSyncStatus === 'loading'}
-                className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-bold text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-xl transition-colors cursor-pointer disabled:opacity-60"
+                onClick={() => onQuickSaveToDrive('json')}
+                disabled={isDriveUploading}
+                className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-bold text-slate-900 bg-white hover:bg-slate-100 border-2 border-slate-300 rounded-xl transition-colors cursor-pointer disabled:opacity-60"
               >
-                ดึงข้อมูลล่าสุดจาก Drive
+                <CloudUpload className="w-3.5 h-3.5" />
+                Save JSON Backup
               </button>
-              {onExportToGoogleSheet && (
-                <button
-                  type="button"
-                  onClick={onExportToGoogleSheet}
-                  disabled={cloudSyncStatus === 'saving'}
-                  className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-bold text-emerald-800 bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 rounded-xl transition-colors cursor-pointer disabled:opacity-60"
-                >
-                  <FileSpreadsheet className="w-3.5 h-3.5" />
-                  สร้างเป็น Google Sheets ใน Drive
-                </button>
-              )}
-              {onLogout && (
-                <button
-                  type="button"
-                  onClick={onLogout}
-                  className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-bold text-red-600 bg-white hover:bg-red-50 border border-red-200 rounded-xl transition-colors cursor-pointer"
-                >
-                  <LogOut className="w-3.5 h-3.5" />
-                  ออกจากระบบ
-                </button>
-              )}
             </>
           ) : (
             <button
               type="button"
-              onClick={onRequestGoogleLogin}
-              className="inline-flex items-center gap-2 px-4 py-2.5 text-xs font-bold text-white bg-slate-900 hover:bg-slate-800 rounded-xl transition-colors cursor-pointer"
+              onClick={onConnectGoogleDrive}
+              disabled={isDriveConnecting}
+              className="inline-flex items-center gap-2 px-4 py-2.5 text-xs font-bold text-white bg-blue-600 hover:bg-blue-700 rounded-xl transition-colors cursor-pointer disabled:opacity-60"
             >
-              <Cloud className="w-4 h-4" />
-              เข้าสู่ระบบด้วย Google (จดจำถาวร)
+              {isDriveConnecting ? (
+                <RefreshCw className="w-4 h-4 animate-spin" />
+              ) : (
+                <Cloud className="w-4 h-4" />
+              )}
+              {isDriveConnecting ? 'Connecting...' : 'Connect Google Drive'}
             </button>
           )}
         </div>
@@ -1114,50 +1043,99 @@ export const BackOfficeView: React.FC<BackOfficeViewProps> = ({
                         {seat.transferDate || '-'}
                       </td>
                       <td className="py-3 px-3 whitespace-nowrap">
-                        {seat.slipUrl ? (
-                          <button
-                            type="button"
-                            onClick={() =>
-                              setActiveSlipPreview({
-                                slipUrl: seat.slipUrl,
-                                title: `สลิปการโอนเงิน — โต๊ะ ${seat.tableNumber}`,
-                                subtitle: seat.fullName
-                                  ? `ผู้จอง: ${seat.fullName}${seat.phone ? ` (${seat.phone})` : ''}`
-                                  : `แผ่นงาน ${seat.sheetName} · แถวที่ ${seat.rowNumber}`,
-                                badgeText: `โซน ${seat.categoryName}`,
-                                accentColor: zoneColor,
-                                amountText: formatBaht(
-                                  seat.transferAmount,
-                                  seat.rawTransferAmount
-                                ),
-                                dateText: seat.transferDate || '-',
-                                isPaid: seat.isPaid,
-                                onTogglePaid: () => {
-                                  const nextPaid = !seat.isPaid;
-                                  const updated = buildUpdatedSeatRecord(seat, {
-                                    isPaid: nextPaid,
-                                  });
-                                  onUpdateRecord(updated);
-                                  setActiveSlipPreview((prev) =>
-                                    prev ? { ...prev, isPaid: nextPaid } : null
-                                  );
-                                },
-                                onReplaceSlipUrl: (newUrl) => {
-                                  const updated = buildUpdatedSeatRecord(seat, {
-                                    slipUrl: newUrl,
-                                  });
-                                  onUpdateRecord(updated);
-                                  setActiveSlipPreview((prev) =>
-                                    prev ? { ...prev, slipUrl: newUrl } : null
-                                  );
-                                },
-                              })
-                            }
-                            className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-bold text-blue-700 bg-blue-50 hover:bg-blue-100 border border-blue-200 cursor-pointer transition-colors"
-                          >
-                            <Eye className="w-3.5 h-3.5" />
-                            ดูรูปสลิป
-                          </button>
+                        {seat.slipUrl || seat.slipUrl2 ? (
+                          <div className="flex items-center gap-1.5">
+                            {seat.slipUrl && (
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  setActiveSlipPreview({
+                                    slipUrl: seat.slipUrl,
+                                    title: `สลิปที่ 1 — โต๊ะ ${seat.tableNumber}`,
+                                    subtitle: seat.fullName
+                                      ? `ผู้จอง: ${seat.fullName}${seat.phone ? ` (${seat.phone})` : ''}`
+                                      : `แผ่นงาน ${seat.sheetName} · แถวที่ ${seat.rowNumber}`,
+                                    badgeText: `โซน ${seat.categoryName} · สลิป 1`,
+                                    accentColor: zoneColor,
+                                    amountText: formatBaht(
+                                      seat.transferAmount,
+                                      seat.rawTransferAmount
+                                    ),
+                                    dateText: seat.transferDate || '-',
+                                    isPaid: seat.isPaid,
+                                    onTogglePaid: () => {
+                                      const nextPaid = !seat.isPaid;
+                                      const updated = buildUpdatedSeatRecord(seat, {
+                                        isPaid: nextPaid,
+                                      });
+                                      onUpdateRecord(updated);
+                                      setActiveSlipPreview((prev) =>
+                                        prev ? { ...prev, isPaid: nextPaid } : null
+                                      );
+                                    },
+                                    onReplaceSlipUrl: (newUrl) => {
+                                      const updated = buildUpdatedSeatRecord(seat, {
+                                        slipUrl: newUrl,
+                                      });
+                                      onUpdateRecord(updated);
+                                      setActiveSlipPreview((prev) =>
+                                        prev ? { ...prev, slipUrl: newUrl } : null
+                                      );
+                                    },
+                                  })
+                                }
+                                className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-bold text-blue-700 bg-blue-50 hover:bg-blue-100 border border-blue-200 cursor-pointer transition-colors"
+                              >
+                                <Eye className="w-3.5 h-3.5" />
+                                สลิป 1
+                              </button>
+                            )}
+                            {seat.slipUrl2 && (
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  setActiveSlipPreview({
+                                    slipUrl: seat.slipUrl2 || '',
+                                    title: `สลิปที่ 2 — โต๊ะ ${seat.tableNumber}`,
+                                    subtitle: seat.fullName
+                                      ? `ผู้จอง: ${seat.fullName}${seat.phone ? ` (${seat.phone})` : ''}`
+                                      : `แผ่นงาน ${seat.sheetName} · แถวที่ ${seat.rowNumber}`,
+                                    badgeText: `โซน ${seat.categoryName} · สลิป 2`,
+                                    accentColor: zoneColor,
+                                    amountText: formatBaht(
+                                      seat.transferAmount,
+                                      seat.rawTransferAmount
+                                    ),
+                                    dateText: seat.transferDate || '-',
+                                    isPaid: seat.isPaid,
+                                    onTogglePaid: () => {
+                                      const nextPaid = !seat.isPaid;
+                                      const updated = buildUpdatedSeatRecord(seat, {
+                                        isPaid: nextPaid,
+                                      });
+                                      onUpdateRecord(updated);
+                                      setActiveSlipPreview((prev) =>
+                                        prev ? { ...prev, isPaid: nextPaid } : null
+                                      );
+                                    },
+                                    onReplaceSlipUrl: (newUrl) => {
+                                      const updated = buildUpdatedSeatRecord(seat, {
+                                        slipUrl2: newUrl,
+                                      });
+                                      onUpdateRecord(updated);
+                                      setActiveSlipPreview((prev) =>
+                                        prev ? { ...prev, slipUrl: newUrl } : null
+                                      );
+                                    },
+                                  })
+                                }
+                                className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-bold text-indigo-700 bg-indigo-50 hover:bg-indigo-100 border border-indigo-200 cursor-pointer transition-colors"
+                              >
+                                <Eye className="w-3.5 h-3.5" />
+                                สลิป 2
+                              </button>
+                            )}
+                          </div>
                         ) : (
                           <span className="text-xs text-slate-400">ไม่มีสลิป</span>
                         )}
@@ -1272,7 +1250,13 @@ export const BackOfficeView: React.FC<BackOfficeViewProps> = ({
                                     rawTransferAmount: '',
                                     transferDate: '',
                                     slipUrl: '',
+                                    slipUrl2: '',
                                     isPaid: false,
+                                    isCheckedIn: false,
+                                    checkedInAt: '',
+                                    isTicketCollected: false,
+                                    ticketCollectedAt: '',
+                                    note: '',
                                   })
                                 )
                               }

@@ -833,15 +833,14 @@ export function downloadExcelTemplate(categories: CategoryConfig[]) {
 }
 
 /**
- * Exports all current edited SeatRecord items across categories AND all ExpenseRecord items
- * plus a Financial Summary sheet into a ready-to-use Excel (.xlsx) file.
+ * Builds the multi-sheet XLSX workbook containing all configured seat categories,
+ * Expenses ("รายจ่าย"), and Financial Summary ("สรุปงบการเงิน").
  */
-export function exportCurrentDataToExcel(
+export function buildCurrentDataWorkbook(
   categories: CategoryConfig[],
   categoryResults: CategorySheetResult[],
-  expenses: ExpenseRecord[],
-  fileName = 'Seat_Bookings_And_Expenses_Updated.xlsx'
-) {
+  expenses: ExpenseRecord[]
+): XLSX.WorkBook {
   const wb = XLSX.utils.book_new();
   const usedNames = new Set<string>();
 
@@ -881,14 +880,15 @@ export function exportCurrentDataToExcel(
         r.phone || '',
         r.transferAmount > 0 ? r.transferAmount : r.rawTransferAmount || '',
         r.transferDate || '',
-        r.slipUrl || '',
+        // Avoid dumping huge base64 strings into Excel cells (Excel cell limit is 32,767 chars)
+        r.slipUrl && !r.slipUrl.startsWith('data:') ? r.slipUrl : r.slipUrl ? '[แนบรูปสลิปในระบบ]' : '',
         r.isPaid ? 'TRUE' : 'FALSE',
         r.isCheckedIn ? 'TRUE' : 'FALSE',
         r.checkedInAt || '',
         r.isTicketCollected ? 'TRUE' : 'FALSE',
         r.ticketCollectedAt || '',
         r.note || '',
-        r.slipUrl2 || '',
+        r.slipUrl2 && !r.slipUrl2.startsWith('data:') ? r.slipUrl2 : r.slipUrl2 ? '[แนบรูปสลิป 2 ในระบบ]' : '',
       ]);
     }
 
@@ -920,7 +920,11 @@ export function exportCurrentDataToExcel(
       exp.categoryLabel || getExpenseCategoryLabel(exp.category),
       exp.amount || 0,
       exp.payeeOrNote || '',
-      exp.receiptUrl || '',
+      exp.receiptUrl && !exp.receiptUrl.startsWith('data:')
+        ? exp.receiptUrl
+        : exp.receiptUrl
+        ? '[แนบรูปใบเสร็จในระบบ]'
+        : '',
     ]);
   }
   const expWs = XLSX.utils.aoa_to_sheet(expenseRows);
@@ -958,6 +962,36 @@ export function exportCurrentDataToExcel(
   sumWs['!cols'] = [{ wch: 48 }, { wch: 22 }];
   XLSX.utils.book_append_sheet(wb, sumWs, 'สรุปงบการเงิน');
 
+  return wb;
+}
+
+/**
+ * Generates raw binary .xlsx bytes (Uint8Array) for real Google Drive multipart uploads.
+ */
+export function generateCurrentDataExcelBytes(
+  categories: CategoryConfig[],
+  categoryResults: CategorySheetResult[],
+  expenses: ExpenseRecord[]
+): Uint8Array {
+  const wb = buildCurrentDataWorkbook(categories, categoryResults, expenses);
+  const arrayBuffer = XLSX.write(wb, {
+    bookType: 'xlsx',
+    type: 'array',
+  }) as ArrayBuffer | Uint8Array;
+  return arrayBuffer instanceof Uint8Array ? arrayBuffer : new Uint8Array(arrayBuffer);
+}
+
+/**
+ * Exports all current edited SeatRecord items across categories AND all ExpenseRecord items
+ * plus a Financial Summary sheet into a ready-to-use Excel (.xlsx) file.
+ */
+export function exportCurrentDataToExcel(
+  categories: CategoryConfig[],
+  categoryResults: CategorySheetResult[],
+  expenses: ExpenseRecord[],
+  fileName = 'Seat_Bookings_And_Expenses_Updated.xlsx'
+) {
+  const wb = buildCurrentDataWorkbook(categories, categoryResults, expenses);
   XLSX.writeFile(wb, fileName);
 }
 

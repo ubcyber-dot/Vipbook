@@ -18,6 +18,7 @@ import {
   normalizeTableNo,
   compactTableNo,
 } from '../utils/excelTemplate';
+import { compressImageFileToDataUrl, sanitizeSafeUrl } from '../utils/media';
 import { SlipPreviewModal } from './SlipPreviewModal';
 
 interface AddTableModalProps {
@@ -248,30 +249,32 @@ export const AddTableModal: React.FC<AddTableModalProps> = ({
 
   const zoneColor = selectedCategory.colorHex || '#2563EB';
 
-  const handleSlipUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleSlipUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
-    const reader = new FileReader();
-    reader.onload = () => {
-      if (typeof reader.result === 'string') {
-        setSlipUrl(reader.result);
-        setMarkAsBooked(true);
-      }
-    };
-    reader.readAsDataURL(file);
+    try {
+      const dataUrl = await compressImageFileToDataUrl(file);
+      setSlipUrl(dataUrl);
+      setMarkAsBooked(true);
+    } catch (err) {
+      console.error('Failed to process slip 1 image:', err);
+    } finally {
+      e.target.value = '';
+    }
   };
 
-  const handleSlip2Upload = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleSlip2Upload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
-    const reader = new FileReader();
-    reader.onload = () => {
-      if (typeof reader.result === 'string') {
-        setSlipUrl2(reader.result);
-        setMarkAsBooked(true);
-      }
-    };
-    reader.readAsDataURL(file);
+    try {
+      const dataUrl = await compressImageFileToDataUrl(file);
+      setSlipUrl2(dataUrl);
+      setMarkAsBooked(true);
+    } catch (err) {
+      console.error('Failed to process slip 2 image:', err);
+    } finally {
+      e.target.value = '';
+    }
   };
 
   const handleSingleSubmit = (e: React.FormEvent) => {
@@ -304,8 +307,8 @@ export const AddTableModal: React.FC<AddTableModalProps> = ({
       transferAmount: markAsBooked ? validAmount : 0,
       rawTransferAmount: markAsBooked && validAmount > 0 ? String(validAmount) : '',
       transferDate: markAsBooked ? transferDate.trim() : '',
-      slipUrl: markAsBooked ? slipUrl.trim() : '',
-      slipUrl2: markAsBooked ? slipUrl2.trim() : '',
+      slipUrl: markAsBooked ? sanitizeSafeUrl(slipUrl) : '',
+      slipUrl2: markAsBooked ? sanitizeSafeUrl(slipUrl2) : '',
       rawPaidStatus: markAsBooked && isPaid ? 'TRUE' : 'FALSE',
       isPaid: markAsBooked ? isPaid : false,
       isBooked: markAsBooked,
