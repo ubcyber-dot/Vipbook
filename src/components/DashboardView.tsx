@@ -26,6 +26,8 @@ import {
 } from '../types/booking';
 import { formatBaht } from './BookingCard';
 import { AddTableModal } from './AddTableModal';
+import { DailyBookingStatusSection } from './DailyBookingStatusSection';
+import { SeatDetailModal } from './SeatDetailModal';
 
 interface DashboardViewProps {
   records: SeatRecord[];
@@ -65,11 +67,27 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   onOpenBackOffice,
   onExportExcel,
   onInspectCategoryInSeatMap,
+  onUpdateRecord,
+  onDeleteRecord,
   onAddRecord,
   onAddMultipleRecords,
   onRequestMoveTable,
 }) => {
   const [isAddModalOpen, setIsAddModalOpen] = useState<boolean>(false);
+  const [activeSeatId, setActiveSeatId] = useState<string | null>(null);
+
+  const activeSeat = useMemo(
+    () => records.find((r) => r.id === activeSeatId) || null,
+    [records, activeSeatId]
+  );
+
+  const categoryColorMap = useMemo(() => {
+    const map: Record<string, string> = {};
+    for (const c of categories) {
+      map[c.id] = c.colorHex;
+    }
+    return map;
+  }, [categories]);
 
   const stats: OverallDashboardStats = useMemo(() => {
     const byCategory: CategorySummaryStats[] = categories.map((cat) => {
@@ -577,6 +595,14 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
         </div>
       </section>
 
+      {/* Daily Ticket & Table Booking Status Breakdown */}
+      <DailyBookingStatusSection
+        records={records}
+        categories={categories}
+        onSelectSeat={(seat) => setActiveSeatId(seat.id)}
+        onRequestAddTable={onAddRecord ? () => setIsAddModalOpen(true) : undefined}
+      />
+
       {/* Per-Category Breakdown Cards (VIP vs Standard & Any Custom Category) */}
       <section className="space-y-4">
         <div className="flex flex-wrap items-center justify-between gap-2">
@@ -752,6 +778,21 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           })}
         </div>
       </section>
+
+      {/* Seat Detail Modal when clicking any table from Daily Booking Status */}
+      <SeatDetailModal
+        record={activeSeat}
+        categoryColor={
+          activeSeat ? categoryColorMap[activeSeat.categoryId] || '#2563EB' : '#2563EB'
+        }
+        categoryColorMap={categoryColorMap}
+        onUpdateRecord={onUpdateRecord}
+        onDeleteRecord={onDeleteRecord}
+        onRequestMoveTable={
+          onRequestMoveTable ? (rec) => onRequestMoveTable(rec) : undefined
+        }
+        onClose={() => setActiveSeatId(null)}
+      />
 
       {/* Add Table Modal */}
       {onAddRecord && (

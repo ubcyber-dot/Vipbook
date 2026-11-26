@@ -27,6 +27,7 @@ import {
   Ticket,
   AlertCircle,
   ArrowRightLeft,
+  CalendarDays,
 } from 'lucide-react';
 import {
   CategoryConfig,
@@ -46,6 +47,7 @@ import { formatPercent } from './DashboardView';
 import { SeatDetailModal } from './SeatDetailModal';
 import { SlipPreviewModal, SlipPreviewData } from './SlipPreviewModal';
 import { AddTableModal } from './AddTableModal';
+import { DailyBookingStatusSection } from './DailyBookingStatusSection';
 
 interface BackOfficeViewProps {
   records: SeatRecord[];
@@ -104,7 +106,7 @@ export const BackOfficeView: React.FC<BackOfficeViewProps> = ({
   onQuickSaveToDrive,
   onLoadFromDrive,
 }) => {
-  const [subTab, setSubTab] = useState<'expenses' | 'bookings'>('expenses');
+  const [subTab, setSubTab] = useState<'expenses' | 'bookings' | 'daily'>('expenses');
 
   // Expense Form State
   const [editingExpenseId, setEditingExpenseId] = useState<string | null>(null);
@@ -700,6 +702,18 @@ export const BackOfficeView: React.FC<BackOfficeViewProps> = ({
         >
           <Armchair className="w-4 h-4" />
           จัดการและแก้ไขข้อมูลโต๊ะ ({records.length} โต๊ะ)
+        </button>
+        <button
+          type="button"
+          onClick={() => setSubTab('daily')}
+          className={`inline-flex items-center gap-2 px-4 py-2.5 rounded-xl text-xs sm:text-sm font-bold transition-colors cursor-pointer ${
+            subTab === 'daily'
+              ? 'bg-indigo-600 text-white shadow-xs'
+              : 'bg-white text-slate-700 border border-slate-200 hover:bg-slate-100'
+          }`}
+        >
+          <CalendarDays className="w-4 h-4" />
+          สถานะการจองบัตรรายวัน ({records.filter((r) => r.isBooked).length} โต๊ะ)
         </button>
       </div>
 
@@ -1444,6 +1458,16 @@ export const BackOfficeView: React.FC<BackOfficeViewProps> = ({
             </table>
           </div>
         </div>
+      )}
+
+      {/* SUB-TAB 3: DAILY BOOKING STATUS */}
+      {subTab === 'daily' && (
+        <DailyBookingStatusSection
+          records={records}
+          categories={categories}
+          onSelectSeat={(seat) => setActiveEditSeatId(seat.id)}
+          onRequestAddTable={() => setIsAddingTable(true)}
+        />
       )}
 
       {/* Zone-Colored Popup Modal when editing a seat from the table manager */}
