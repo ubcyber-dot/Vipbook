@@ -192,13 +192,17 @@ export const ExcelTemplateImporter: React.FC<ExcelTemplateImporterProps> = ({
       ? parseExpensesFromWorkbook(targetWorkbook)
       : undefined;
 
-    await onImportSheets(
-      updatedCategories,
-      payloads,
-      title,
-      availableSheets,
-      importedExpenses
-    );
+    try {
+      await onImportSheets(
+        updatedCategories,
+        payloads,
+        title,
+        availableSheets,
+        importedExpenses
+      );
+    } catch (err: any) {
+      setParseError(err?.message || 'เกิดข้อผิดพลาดในการนำเข้าข้อมูลจากไฟล์ Excel');
+    }
   };
 
   const handleWorkbookUpload = async (file: File | null) => {

@@ -1,8 +1,9 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import {
   X,
   Cloud,
   CloudUpload,
+  CloudDownload,
   CheckCircle2,
   AlertCircle,
   ExternalLink,
@@ -17,6 +18,7 @@ import {
   Download,
   ShieldCheck,
   AlertTriangle,
+  CopyPlus,
 } from 'lucide-react';
 import {
   CategoryConfig,
@@ -25,12 +27,17 @@ import {
 } from '../types/booking';
 import { CloudSystemState } from '../services/sheetsApi';
 import {
+  CANONICAL_EXCEL_EXPORT_FILENAME,
+  CANONICAL_JSON_BACKUP_FILENAME,
   DRIVE_FILE_SCOPE,
   DriveConnectionState,
   DriveUploadedFile,
   connectGoogleDrive,
   disconnectGoogleDrive,
+  downloadBinaryFileFromGoogleDrive,
   downloadJsonFileFromGoogleDrive,
+  findExistingDriveFileByName,
+  getActiveDriveFiles,
   getDefaultAppletClientId,
   getDriveConnectionState,
   getStoredDriveClientId,
@@ -38,9 +45,13 @@ import {
   saveDriveClientId,
   uploadFileToGoogleDrive,
 } from '../services/googleDriveGis';
-import { generateCurrentDataExcelBytes } from '../utils/excelTemplate';
+import {
+  buildCloudSystemStateFromExcelBuffer,
+  generateCurrentDataExcelBytes,
+  validateAndHydrateCloudState,
+} from '../utils/excelTemplate';
 
-export type DriveExportFormat = 'xlsx' | 'json';
+export type DriveExportFormat = 'json' | 'xlsx';
 
 interface GoogleDriveModalProps {
   isOpen: boolean;
@@ -56,17 +67,22 @@ interface GoogleDriveModalProps {
   onRestoreCloudState: (state: CloudSystemState, sourceFile: DriveUploadedFile) => void;
 }
 
-function getDefaultFilename(format: DriveExportFormat): string {
+function getCanonicalFilename(format: DriveExportFormat): string {
+  return format === 'json'
+    ? CANONICAL_JSON_BACKUP_FILENAME
+    : CANONICAL_EXCEL_EXPORT_FILENAME;
+}
+
+function getTimestampedCopyFilename(format: DriveExportFormat): string {
   const now = new Date();
   const yyyy = now.getFullYear();
   const mm = String(now.getMonth() + 1).padStart(2, '0');
   const dd = String(now.getDate()).padStart(2, '0');
   const hh = String(now.getHours()).padStart(2, '0');
   const min = String(now.getMinutes()).padStart(2, '0');
-  if (format === 'xlsx') {
-    return `Seat_Bookings_VIP_Standard_${yyyy}-${mm}-${dd}_${hh}${min}.xlsx`;
-  }
-  return `Seat_Booking_System_Backup_${yyyy}-${mm}-${dd}_${hh}${min}.json`;
+  return format === 'xlsx'
+    ? `Seat_Bookings_VIP_Standard_${yyyy}-${mm}-${dd}_${hh}${min}.xlsx`
+    : `Seat_Booking_System_Backup_${yyyy}-${mm}-${dd}_${hh}${min}.json`;
 }
 
 function formatBytes(sizeStr?: string): string {
@@ -75,6 +91,22 @@ function formatBytes(sizeStr?: string): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+}
+
+function isJsonDriveFile(file: DriveUploadedFile): boolean {
+  return (
+    file.mimeType === 'application/json' ||
+    file.name.toLowerCase().endsWith('.json')
+  );
+}
+
+function isExcelDriveFile(file: DriveUploadedFile): boolean {
+  return (
+    file.mimeType ===
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' ||
+    file.name.toLowerCase().endsWith('.xlsx') ||
+    file.name.toLowerCase().endsWith('.xls')
+  );
 }
 
 export const GoogleDriveModal: React.FC<GoogleDriveModalProps> = ({
@@ -95,12 +127,14 @@ export const GoogleDriveModal: React.FC<GoogleDriveModalProps> = ({
   const [clientIdSavedNotice, setClientIdSavedNotice] = useState<boolean>(false);
   const [copiedOrigin, setCopiedOrigin] = useState<boolean>(false);
 
-  // Connection & Upload States
+  // Connection, Upload, & Restore States
   const [isConnecting, setIsConnecting] = useState<boolean>(false);
+  const [isDisconnecting, setIsDisconnecting] = useState<boolean>(false);
   const [isUploading, setIsUploading] = useState<boolean>(false);
-  const [uploadFormat, setUploadFormat] = useState<DriveExportFormat>('xlsx');
-  const [filename, setFilename] = useState<string>(() => getDefaultFilename('xlsx'));
+  const [uploadFormat, setUploadFormat] = useState<DriveExportFormat>('json');
+  const [filename, setFilename] = useState<string>(() => getCanonicalFilename('json'));
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [statusNotice, setStatusNotice] = useState<string | null>(null);
   const [latestUpload, setLatestUpload] = useState<DriveUploadedFile | null>(lastUploadedFile);
 
   // Real App-Created Drive Files List
@@ -108,8 +142,12 @@ export const GoogleDriveModal: React.FC<GoogleDriveModalProps> = ({
   const [isLoadingFiles, setIsLoadingFiles] = useState<boolean>(false);
   const [restoringFileId, setRestoringFileId] = useState<string | null>(null);
 
-  // Explicit Confirmation State before Overwriting an Existing Drive File or Restoring
-  const [pendingOverwriteFile, setPendingOverwriteFile] = useState<DriveUploadedFile | null>(null);
+  // Explicit Confirmation State before Overwriting an Existing Drive File or Restoring Workspace
+  const [pendingOverwrite, setPendingOverwrite] = useState<{
+    file: DriveUploadedFile;
+    targetName: string;
+    format: DriveExportFormat;
+  } | null>(null);
   const [pendingRestoreFile, setPendingRestoreFile] = useState<DriveUploadedFile | null>(null);
 
   const defaultClientId = getDefaultAppletClientId();
@@ -119,14 +157,16 @@ export const GoogleDriveModal: React.FC<GoogleDriveModalProps> = ({
     setLatestUpload(lastUploadedFile);
   }, [lastUploadedFile]);
 
-  const refreshDriveFiles = useCallback(async () => {
-    if (!getDriveConnectionState().connected) return;
+  const refreshDriveFiles = useCallback(async (): Promise<DriveUploadedFile[]> => {
+    if (!getDriveConnectionState().connected) return [];
     setIsLoadingFiles(true);
     try {
       const files = await listAppCreatedDriveFiles();
       setDriveFiles(files);
+      return files;
     } catch (err: any) {
-      setErrorMessage(err?.message || 'Failed to load files from Google Drive.');
+      setErrorMessage(err?.message || 'ไม่สามารถดึงรายการไฟล์จาก Google Drive ได้');
+      return [];
     } finally {
       setIsLoadingFiles(false);
     }
@@ -135,32 +175,61 @@ export const GoogleDriveModal: React.FC<GoogleDriveModalProps> = ({
   useEffect(() => {
     if (!isOpen) return;
     setClientIdInput(getStoredDriveClientId());
-    setFilename(getDefaultFilename(uploadFormat));
+    setFilename(getCanonicalFilename(uploadFormat));
     setErrorMessage(null);
-    setPendingOverwriteFile(null);
+    setStatusNotice(null);
+    setPendingOverwrite(null);
     setPendingRestoreFile(null);
 
-    if (connectionState.connected) {
+    if (connectionState.connected && !connectionState.needsReauth) {
       refreshDriveFiles();
     }
-  }, [isOpen, connectionState.connected, refreshDriveFiles]);
+  }, [isOpen, connectionState.connected, connectionState.needsReauth, refreshDriveFiles]);
 
   useEffect(() => {
     if (!isOpen) return;
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
+      if (e.key === 'Escape' && !isUploading && !restoringFileId) {
         onClose();
       }
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [isOpen, onClose]);
+  }, [isOpen, isUploading, restoringFileId, onClose]);
+
+  const matchedExistingFile = useMemo(() => {
+    const clean = filename.trim().toLowerCase();
+    if (!clean) return null;
+    const byName = driveFiles.find((f) => f.name.toLowerCase() === clean);
+    if (byName) return byName;
+
+    const tracked = getActiveDriveFiles()[uploadFormat];
+    if (tracked && tracked.name.toLowerCase() === clean) {
+      return tracked;
+    }
+    return null;
+  }, [driveFiles, filename, uploadFormat]);
+
+  const latestRestorableBackup = useMemo(() => {
+    const jsonFirst = driveFiles.find((f) => isJsonDriveFile(f));
+    if (jsonFirst) return jsonFirst;
+    return driveFiles.find((f) => isExcelDriveFile(f)) || null;
+  }, [driveFiles]);
 
   if (!isOpen) return null;
 
+  const isBusy =
+    isConnecting ||
+    isDisconnecting ||
+    isUploading ||
+    isLoadingFiles ||
+    Boolean(restoringFileId) ||
+    connectionState.isRefreshing;
+
   const handleFormatChange = (nextFormat: DriveExportFormat) => {
     setUploadFormat(nextFormat);
-    setFilename(getDefaultFilename(nextFormat));
+    setFilename(getCanonicalFilename(nextFormat));
+    setPendingOverwrite(null);
   };
 
   const handleSaveClientId = (e?: React.FormEvent) => {
@@ -187,39 +256,57 @@ export const GoogleDriveModal: React.FC<GoogleDriveModalProps> = ({
     saveDriveClientId(trimmedClientId);
     setIsConnecting(true);
     setErrorMessage(null);
+    setStatusNotice(null);
     try {
-      await connectGoogleDrive(trimmedClientId, { prompt: 'consent' });
+      await connectGoogleDrive(trimmedClientId, {
+        prompt: connectionState.connected ? 'select_account' : 'consent',
+      });
       await refreshDriveFiles();
     } catch (err: any) {
-      setErrorMessage(err?.message || 'Failed to authenticate with Google Drive.');
+      setErrorMessage(err?.message || 'ไม่สามารถเชื่อมต่อบัญชี Google Drive ได้');
     } finally {
       setIsConnecting(false);
     }
   };
 
   const handleDisconnectDrive = async () => {
-    await disconnectGoogleDrive();
-    setDriveFiles([]);
-    setPendingOverwriteFile(null);
-    setPendingRestoreFile(null);
+    setIsDisconnecting(true);
     setErrorMessage(null);
+    setStatusNotice(null);
+    try {
+      await disconnectGoogleDrive();
+      setDriveFiles([]);
+      setPendingOverwrite(null);
+      setPendingRestoreFile(null);
+      setLatestUpload(null);
+    } finally {
+      setIsDisconnecting(false);
+    }
   };
 
-  const executeRealDriveUpload = async (existingFileId?: string) => {
-    const trimmedName = filename.trim() || getDefaultFilename(uploadFormat);
-    const finalName =
-      uploadFormat === 'xlsx' && !trimmedName.toLowerCase().endsWith('.xlsx')
-        ? `${trimmedName}.xlsx`
-        : uploadFormat === 'json' && !trimmedName.toLowerCase().endsWith('.json')
-        ? `${trimmedName}.json`
-        : trimmedName;
+  const normalizeTargetFilename = (rawName: string, fmt: DriveExportFormat): string => {
+    const trimmed = rawName.trim() || getCanonicalFilename(fmt);
+    if (fmt === 'xlsx' && !trimmed.toLowerCase().endsWith('.xlsx')) {
+      return `${trimmed}.xlsx`;
+    }
+    if (fmt === 'json' && !trimmed.toLowerCase().endsWith('.json')) {
+      return `${trimmed}.json`;
+    }
+    return trimmed;
+  };
 
+  const executeRealDriveUpload = async (options: {
+    format: DriveExportFormat;
+    targetName: string;
+    existingFileId?: string;
+  }) => {
+    const finalName = normalizeTargetFilename(options.targetName, options.format);
     setIsUploading(true);
     setErrorMessage(null);
-    setPendingOverwriteFile(null);
+    setStatusNotice(null);
+    setPendingOverwrite(null);
 
     try {
-      // Ensure user is connected before uploading
       if (!getDriveConnectionState().connected) {
         const trimmedClientId = clientIdInput.trim();
         saveDriveClientId(trimmedClientId);
@@ -228,7 +315,7 @@ export const GoogleDriveModal: React.FC<GoogleDriveModalProps> = ({
 
       let uploaded: DriveUploadedFile;
 
-      if (uploadFormat === 'xlsx') {
+      if (options.format === 'xlsx') {
         const excelBytes = generateCurrentDataExcelBytes(
           categories,
           categoryResults,
@@ -241,7 +328,7 @@ export const GoogleDriveModal: React.FC<GoogleDriveModalProps> = ({
           content: excelBytes,
           description:
             'VIP & Standard Seat Booking & Back-Office Expenses Excel Export',
-          existingFileId,
+          existingFileId: options.existingFileId,
         });
       } else {
         const payload: CloudSystemState = {
@@ -253,45 +340,145 @@ export const GoogleDriveModal: React.FC<GoogleDriveModalProps> = ({
           availableSheets,
           updatedAt: new Date().toISOString(),
         };
-        const jsonText = JSON.stringify(payload, null, 2);
         uploaded = await uploadFileToGoogleDrive({
           filename: finalName,
           mimeType: 'application/json',
-          content: jsonText,
+          content: JSON.stringify(payload, null, 2),
           description:
             'VIP & Standard Seat Booking System Complete JSON Backup',
-          existingFileId,
+          existingFileId: options.existingFileId,
         });
       }
 
       setLatestUpload(uploaded);
+      setStatusNotice(
+        options.existingFileId
+          ? `อัปเดตไฟล์เดิม "${uploaded.name}" บน Google Drive เรียบร้อยแล้ว`
+          : `สร้างไฟล์ใหม่ "${uploaded.name}" บน Google Drive เรียบร้อยแล้ว`
+      );
       onUploadSuccess(uploaded);
-      // Update file list from Drive
       await refreshDriveFiles();
     } catch (err: any) {
       setErrorMessage(
-        err?.message || 'Upload to Google Drive failed. Please check your permissions and try again.'
+        err?.message ||
+          'อัปโหลดไฟล์ไปยัง Google Drive ไม่สำเร็จ กรุณาตรวจสอบอินเทอร์เน็ตหรือสิทธิ์การเข้าถึง'
       );
     } finally {
       setIsUploading(false);
     }
   };
 
+  /**
+   * Smart Save handler: checks if a non-trashed file with the same name already exists in Drive.
+   * If yes -> asks explicit confirmation to PATCH (update without duplicating).
+   * If no -> creates a fresh file via POST directly.
+   */
+  const handleSmartSaveClick = async () => {
+    const finalName = normalizeTargetFilename(filename, uploadFormat);
+    setErrorMessage(null);
+    setStatusNotice(null);
+
+    try {
+      if (!getDriveConnectionState().connected) {
+        setIsConnecting(true);
+        try {
+          const trimmedClientId = clientIdInput.trim();
+          saveDriveClientId(trimmedClientId);
+          await connectGoogleDrive(trimmedClientId, { prompt: 'consent' });
+        } finally {
+          setIsConnecting(false);
+        }
+      }
+
+      // Check local list first, then query Drive for exact filename to prevent accidental duplicates
+      let existing = matchedExistingFile;
+      if (!existing) {
+        setIsLoadingFiles(true);
+        try {
+          existing = await findExistingDriveFileByName(finalName);
+        } finally {
+          setIsLoadingFiles(false);
+        }
+      }
+
+      if (existing) {
+        setPendingOverwrite({
+          file: existing,
+          targetName: finalName,
+          format: uploadFormat,
+        });
+        return;
+      }
+
+      await executeRealDriveUpload({
+        format: uploadFormat,
+        targetName: finalName,
+      });
+    } catch (err: any) {
+      setErrorMessage(
+        err?.message || 'ไม่สามารถตรวจสอบไฟล์บน Google Drive ได้ กรุณาลองใหม่อีกครั้ง'
+      );
+    }
+  };
+
+  const handleSaveAsNewCopyClick = async () => {
+    const copyName = getTimestampedCopyFilename(uploadFormat);
+    await executeRealDriveUpload({
+      format: uploadFormat,
+      targetName: copyName,
+    });
+  };
+
+  const handleClickLoadLatestBackup = async () => {
+    setErrorMessage(null);
+    setStatusNotice(null);
+    try {
+      const files = driveFiles.length > 0 ? driveFiles : await refreshDriveFiles();
+      const target =
+        files.find((f) => isJsonDriveFile(f)) ||
+        files.find((f) => isExcelDriveFile(f));
+
+      if (!target) {
+        setErrorMessage(
+          'ไม่พบไฟล์สำรอง (.json หรือ .xlsx) ใน Google Drive ของคุณ กด "Save to Google Drive" เพื่อสร้างไฟล์สำรองแรก'
+        );
+        return;
+      }
+      setPendingRestoreFile(target);
+    } catch (err: any) {
+      setErrorMessage(err?.message || 'ไม่สามารถค้นหาไฟล์สำรองล่าสุดจาก Google Drive ได้');
+    }
+  };
+
   const handleConfirmRestore = async (file: DriveUploadedFile) => {
     setRestoringFileId(file.id);
     setErrorMessage(null);
+    setStatusNotice(null);
     setPendingRestoreFile(null);
+
     try {
-      const parsed = await downloadJsonFileFromGoogleDrive<CloudSystemState>(file.id);
-      if (!parsed || !Array.isArray(parsed.categoryResults)) {
+      let hydratedState: CloudSystemState;
+
+      if (isJsonDriveFile(file)) {
+        const rawJson = await downloadJsonFileFromGoogleDrive<unknown>(file.id);
+        hydratedState = validateAndHydrateCloudState(rawJson, categories);
+      } else if (isExcelDriveFile(file)) {
+        const buffer = await downloadBinaryFileFromGoogleDrive(file.id);
+        hydratedState = buildCloudSystemStateFromExcelBuffer(
+          buffer,
+          file.name,
+          categories
+        );
+      } else {
         throw new Error(
-          'This JSON file does not match the Seat Booking System backup schema.'
+          `ไม่รองรับรูปแบบไฟล์ "${file.name}" กรุณาเลือกไฟล์สำรอง .json หรือ .xlsx`
         );
       }
-      onRestoreCloudState(parsed, file);
+
+      onRestoreCloudState(hydratedState, file);
     } catch (err: any) {
       setErrorMessage(
-        err?.message || 'Failed to download or parse backup file from Google Drive.'
+        err?.message || 'ไม่สามารถดาวน์โหลดหรืออ่านข้อมูลไฟล์สำรองจาก Google Drive ได้'
       );
     } finally {
       setRestoringFileId(null);
@@ -303,7 +490,9 @@ export const GoogleDriveModal: React.FC<GoogleDriveModalProps> = ({
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-6 bg-slate-950/65 backdrop-blur-xs overflow-y-auto"
-      onClick={onClose}
+      onClick={() => {
+        if (!isUploading && !restoringFileId) onClose();
+      }}
     >
       <div
         className="w-full max-w-3xl bg-white rounded-3xl border-[3px] border-slate-300 shadow-2xl overflow-hidden my-auto flex flex-col max-h-[92vh]"
@@ -317,10 +506,10 @@ export const GoogleDriveModal: React.FC<GoogleDriveModalProps> = ({
             </div>
             <div className="min-w-0">
               <h2 className="text-base sm:text-lg font-extrabold tracking-tight truncate">
-                Google Drive Settings &amp; Save to Google Drive
+                Google Drive Sync — Save &amp; Restore Data
               </h2>
               <p className="text-xs text-slate-300 truncate">
-                เชื่อมต่อ Google Drive จริงผ่าน Google Identity Services (GIS) &amp; Drive API v3
+                เซสชันถาวร + ต่ออายุ Token อัตโนมัติ + บันทึก/ดึงข้อมูลจริงผ่าน Google Drive API v3
               </p>
             </div>
           </div>
@@ -328,8 +517,9 @@ export const GoogleDriveModal: React.FC<GoogleDriveModalProps> = ({
           <button
             type="button"
             onClick={onClose}
+            disabled={isUploading || Boolean(restoringFileId)}
             aria-label="Close Google Drive modal"
-            className="p-2 text-slate-300 hover:text-white bg-white/10 hover:bg-white/20 rounded-xl transition-colors cursor-pointer shrink-0"
+            className="p-2 text-slate-300 hover:text-white bg-white/10 hover:bg-white/20 disabled:opacity-40 rounded-xl transition-colors cursor-pointer shrink-0"
           >
             <X className="w-5 h-5" />
           </button>
@@ -337,13 +527,13 @@ export const GoogleDriveModal: React.FC<GoogleDriveModalProps> = ({
 
         {/* Modal Body */}
         <div className="p-5 sm:p-6 overflow-y-auto space-y-5">
-          {/* Error Alert Banner (Real GIS / Google Drive API Errors) */}
+          {/* Error Alert Banner */}
           {errorMessage && (
             <div className="p-4 rounded-2xl bg-red-50 border-2 border-red-300 flex items-start gap-3 text-red-900">
               <AlertCircle className="w-5 h-5 text-red-600 shrink-0 mt-0.5" />
               <div className="space-y-1 min-w-0 flex-1">
                 <p className="text-xs font-extrabold uppercase tracking-wide text-red-700">
-                  Google Drive Authentication / Upload Error
+                  Google Drive Error
                 </p>
                 <p className="text-xs sm:text-sm font-medium break-words whitespace-pre-wrap">
                   {errorMessage}
@@ -366,7 +556,7 @@ export const GoogleDriveModal: React.FC<GoogleDriveModalProps> = ({
                 <CheckCircle2 className="w-5 h-5 text-emerald-600 shrink-0 mt-0.5" />
                 <div className="min-w-0 space-y-0.5">
                   <p className="text-xs font-extrabold text-emerald-800">
-                    บันทึกไฟล์ขึ้น Google Drive สำเร็จแล้ว! (Saved to My Drive Root)
+                    {statusNotice || 'ซิงก์กับ Google Drive สำเร็จแล้ว!'}
                   </p>
                   <p className="text-sm font-bold text-slate-900 truncate">
                     {latestUpload.name}
@@ -390,13 +580,479 @@ export const GoogleDriveModal: React.FC<GoogleDriveModalProps> = ({
             </div>
           )}
 
-          {/* SECTION 1: Google Drive Settings (OAuth Client ID) */}
-          <section className="p-4 sm:p-5 rounded-2xl bg-slate-50 border-2 border-slate-200 space-y-3.5">
+          {/* SECTION 1: Persistent Account Session (Stay Logged In Until Manual Sign Out) */}
+          <section className="p-4 sm:p-5 rounded-2xl bg-white border-2 border-slate-300 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+            <div className="space-y-1.5 min-w-0 flex-1">
+              <div className="flex flex-wrap items-center gap-2">
+                <h3 className="text-sm font-extrabold text-slate-900">
+                  1. สถานะบัญชี Google Drive (เข้าสู่ระบบค้างไว้อัตโนมัติ)
+                </h3>
+                {connectionState.isRefreshing ? (
+                  <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-md text-xs font-bold bg-blue-100 text-blue-800 border border-blue-300">
+                    <RefreshCw className="w-3 h-3 animate-spin" />
+                    กำลังต่ออายุเซสชัน...
+                  </span>
+                ) : connectionState.connected && !connectionState.needsReauth ? (
+                  <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-md text-xs font-bold bg-emerald-100 text-emerald-800 border border-emerald-300">
+                    <CheckCircle2 className="w-3.5 h-3.5" />
+                    {connectionState.tokenValid ? 'Connected' : 'Connected (Auto-Refresh Ready)'}
+                  </span>
+                ) : connectionState.connected && connectionState.needsReauth ? (
+                  <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-md text-xs font-bold bg-amber-100 text-amber-900 border border-amber-300">
+                    <AlertTriangle className="w-3.5 h-3.5" />
+                    ต้องการยืนยันสิทธิ์อีกครั้ง
+                  </span>
+                ) : (
+                  <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-md text-xs font-bold bg-slate-100 text-slate-700 border border-slate-300">
+                    Not Connected
+                  </span>
+                )}
+              </div>
+
+              <div className="flex items-center gap-2.5 text-xs text-slate-600">
+                {connectionState.user?.photoLink && (
+                  <img
+                    src={connectionState.user.photoLink}
+                    alt={connectionState.user.displayName || 'Google User'}
+                    className="w-7 h-7 rounded-full border border-slate-300 shrink-0"
+                    referrerPolicy="no-referrer"
+                  />
+                )}
+                <p className="min-w-0 break-words">
+                  {connectionState.connected ? (
+                    <>
+                      <span className="font-bold text-slate-900">
+                        {connectionState.user?.displayName || 'บัญชี Google Drive'}
+                      </span>
+                      {connectionState.user?.emailAddress && (
+                        <span className="font-mono text-slate-700">
+                          {' '}
+                          ({connectionState.user.emailAddress})
+                        </span>
+                      )}
+                      {connectionState.expiresAt && connectionState.tokenValid ? (
+                        <span className="text-slate-500 font-mono">
+                          {' '}
+                          · Token หมดอายุ{' '}
+                          {new Date(connectionState.expiresAt).toLocaleTimeString('th-TH')} (ต่ออายุอัตโนมัติ)
+                        </span>
+                      ) : (
+                        <span className="text-slate-500">
+                          {' '}
+                          · ระบบจะต่ออายุ Token อัตโนมัติเมื่อบันทึกหรือดึงข้อมูล
+                        </span>
+                      )}
+                    </>
+                  ) : (
+                    <>
+                      เชื่อมต่อด้วย Google Identity Services (<code className="font-mono">{DRIVE_FILE_SCOPE}</code>) ระบบจะจดจำเซสชันไว้จนกว่าคุณจะกด Sign Out
+                    </>
+                  )}
+                </p>
+              </div>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2 shrink-0">
+              <button
+                type="button"
+                onClick={handleConnectDrive}
+                disabled={isBusy || !clientIdInput.trim()}
+                className="inline-flex items-center justify-center gap-2 px-4 py-2.5 text-xs font-bold text-white bg-blue-600 hover:bg-blue-700 disabled:opacity-50 rounded-xl shadow-xs transition-colors cursor-pointer whitespace-nowrap"
+              >
+                {isConnecting ? (
+                  <>
+                    <RefreshCw className="w-4 h-4 animate-spin" />
+                    Connecting...
+                  </>
+                ) : (
+                  <>
+                    <ShieldCheck className="w-4 h-4" />
+                    {connectionState.connected
+                      ? connectionState.needsReauth
+                        ? 'Reconnect Now'
+                        : 'Switch / Reconnect'
+                      : 'Connect Google Drive'}
+                  </>
+                )}
+              </button>
+
+              {connectionState.connected && (
+                <button
+                  type="button"
+                  onClick={handleDisconnectDrive}
+                  disabled={isBusy}
+                  title="Sign out, revoke OAuth token, and clear local session"
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2.5 text-xs font-bold text-red-700 bg-red-50 hover:bg-red-100 disabled:opacity-50 border border-red-200 rounded-xl cursor-pointer whitespace-nowrap"
+                >
+                  <LogOut className="w-3.5 h-3.5" />
+                  {isDisconnecting ? 'Signing Out...' : 'Sign Out / Disconnect'}
+                </button>
+              )}
+            </div>
+          </section>
+
+          {/* SECTION 2: Load / Sync Data FROM Google Drive */}
+          {connectionState.connected && (
+            <section className="p-4 sm:p-5 rounded-2xl bg-blue-50/60 border-2 border-blue-200 space-y-3.5">
+              <div className="flex flex-wrap items-center justify-between gap-2.5">
+                <div className="space-y-0.5">
+                  <div className="flex items-center gap-2">
+                    <FolderOpen className="w-4 h-4 text-blue-700" />
+                    <h3 className="text-sm font-extrabold text-slate-900">
+                      2. Load / Sync from Google Drive (ดึงข้อมูลกลับเข้าระบบ)
+                    </h3>
+                  </div>
+                  <p className="text-xs text-slate-600">
+                    พบไฟล์สำรองทั้งหมด {driveFiles.length} ไฟล์ (เรียงจากแก้ไขล่าสุด) รองรับทั้งไฟล์ .json และ .xlsx
+                  </p>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={handleClickLoadLatestBackup}
+                    disabled={isBusy}
+                    className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-extrabold text-white bg-blue-600 hover:bg-blue-700 disabled:opacity-50 rounded-xl shadow-xs transition-colors cursor-pointer"
+                  >
+                    {restoringFileId ? (
+                      <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                    ) : (
+                      <CloudDownload className="w-3.5 h-3.5" />
+                    )}
+                    {restoringFileId
+                      ? 'กำลังดึงข้อมูล...'
+                      : latestRestorableBackup
+                      ? 'Load Latest Backup'
+                      : 'Check & Load Latest'}
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={refreshDriveFiles}
+                    disabled={isBusy}
+                    className="inline-flex items-center gap-1 px-3 py-2 text-xs font-bold text-slate-700 bg-white hover:bg-slate-100 disabled:opacity-50 border border-slate-300 rounded-xl cursor-pointer"
+                  >
+                    <RefreshCw className={`w-3.5 h-3.5 ${isLoadingFiles ? 'animate-spin' : ''}`} />
+                    Refresh
+                  </button>
+                </div>
+              </div>
+
+              {/* Explicit Confirmation Dialog for Restoring a Backup */}
+              {pendingRestoreFile && (
+                <div className="p-3.5 rounded-xl bg-white border-2 border-blue-500 flex flex-wrap items-center justify-between gap-3 shadow-xs">
+                  <div className="flex items-start gap-2.5 text-xs text-slate-900 min-w-0 flex-1">
+                    <AlertTriangle className="w-4 h-4 text-blue-600 shrink-0 mt-0.5" />
+                    <p className="break-words">
+                      ยืนยันการโหลดข้อมูลจากไฟล์{' '}
+                      <strong className="font-mono text-blue-900">{pendingRestoreFile.name}</strong>
+                      {pendingRestoreFile.modifiedTime && (
+                        <> ({new Date(pendingRestoreFile.modifiedTime).toLocaleString('th-TH')})</>
+                      )}
+                      ? ข้อมูลบนหน้าจอปัจจุบันจะถูกแทนที่ด้วยข้อมูลจาก Google Drive ไฟล์นี้
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-2 shrink-0">
+                    <button
+                      type="button"
+                      onClick={() => setPendingRestoreFile(null)}
+                      disabled={Boolean(restoringFileId)}
+                      className="px-3 py-1.5 text-xs font-bold text-slate-700 bg-slate-100 hover:bg-slate-200 border border-slate-300 rounded-lg cursor-pointer"
+                    >
+                      ยกเลิก
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleConfirmRestore(pendingRestoreFile)}
+                      disabled={Boolean(restoringFileId)}
+                      className="inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-bold text-white bg-blue-600 hover:bg-blue-700 disabled:opacity-50 rounded-lg cursor-pointer"
+                    >
+                      {restoringFileId && <RefreshCw className="w-3.5 h-3.5 animate-spin" />}
+                      ยืนยันโหลดข้อมูลจาก Drive
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {isLoadingFiles ? (
+                <div className="py-5 text-center text-xs font-semibold text-blue-700 flex items-center justify-center gap-2">
+                  <RefreshCw className="w-4 h-4 animate-spin" />
+                  กำลังดึงรายการไฟล์สำรองจาก Google Drive...
+                </div>
+              ) : driveFiles.length === 0 ? (
+                <p className="text-xs text-slate-600 py-4 text-center bg-white/80 rounded-xl border border-blue-200/70">
+                  ยังไม่พบไฟล์สำรองใน Google Drive กดปุ่ม &ldquo;Save to Google Drive&rdquo; ด้านล่างเพื่อสร้างไฟล์แรก
+                </p>
+              ) : (
+                <div className="space-y-2 max-h-56 overflow-y-auto pr-1">
+                  {driveFiles.map((file, index) => {
+                    const isJson = isJsonDriveFile(file);
+                    const isExcel = isExcelDriveFile(file);
+                    const canRestore = isJson || isExcel;
+                    const isMatchingFormat =
+                      (uploadFormat === 'json' && isJson) ||
+                      (uploadFormat === 'xlsx' && isExcel);
+
+                    return (
+                      <div
+                        key={file.id}
+                        className="p-3 rounded-xl bg-white border border-slate-200 hover:border-blue-300 flex flex-wrap items-center justify-between gap-2.5 transition-colors"
+                      >
+                        <div className="flex items-center gap-2.5 min-w-0 flex-1">
+                          {isJson ? (
+                            <FileJson className="w-4 h-4 text-blue-600 shrink-0" />
+                          ) : (
+                            <FileSpreadsheet className="w-4 h-4 text-emerald-600 shrink-0" />
+                          )}
+                          <div className="min-w-0">
+                            <div className="flex items-center gap-1.5">
+                              <p className="text-xs font-bold text-slate-900 truncate">
+                                {file.name}
+                              </p>
+                              {index === 0 && (
+                                <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-blue-100 text-blue-800 shrink-0">
+                                  ล่าสุด
+                                </span>
+                              )}
+                            </div>
+                            <p className="text-[11px] font-mono text-slate-500">
+                              {file.modifiedTime
+                                ? new Date(file.modifiedTime).toLocaleString('th-TH')
+                                : '-'}
+                              {file.size ? ` · ${formatBytes(file.size)}` : ''}
+                            </p>
+                          </div>
+                        </div>
+
+                        <div className="flex items-center gap-1.5 shrink-0">
+                          {canRestore && (
+                            <button
+                              type="button"
+                              onClick={() => setPendingRestoreFile(file)}
+                              disabled={isBusy}
+                              className="inline-flex items-center gap-1 px-2.5 py-1.5 text-[11px] font-bold text-blue-700 bg-blue-50 hover:bg-blue-100 disabled:opacity-50 border border-blue-200 rounded-lg cursor-pointer"
+                            >
+                              {restoringFileId === file.id ? (
+                                <RefreshCw className="w-3 h-3 animate-spin" />
+                              ) : (
+                                <Download className="w-3 h-3" />
+                              )}
+                              {restoringFileId === file.id ? 'กำลังโหลด...' : 'โหลดข้อมูล'}
+                            </button>
+                          )}
+                          {isMatchingFormat && (
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setPendingOverwrite({
+                                  file,
+                                  targetName: file.name,
+                                  format: isJson ? 'json' : 'xlsx',
+                                })
+                              }
+                              disabled={isBusy}
+                              className="px-2.5 py-1.5 text-[11px] font-bold text-amber-800 bg-amber-50 hover:bg-amber-100 disabled:opacity-50 border border-amber-200 rounded-lg cursor-pointer"
+                            >
+                              อัปเดตไฟล์นี้
+                            </button>
+                          )}
+                          <a
+                            href={file.webViewLink}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="inline-flex items-center gap-1 px-2.5 py-1.5 text-[11px] font-bold text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-lg"
+                          >
+                            <ExternalLink className="w-3 h-3" />
+                            เปิดใน Drive
+                          </a>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </section>
+          )}
+
+          {/* SECTION 3: Save to Google Drive (Clean Update Existing via PATCH or Create New) */}
+          <section className="p-4 sm:p-5 rounded-2xl bg-white border-2 border-slate-300 space-y-4">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <h3 className="text-sm font-extrabold text-slate-900">
+                  3. Save to Google Drive (อัปเดตไฟล์เดิมอัตโนมัติ ไม่สร้างไฟล์ซ้ำ)
+                </h3>
+                <p className="text-xs text-slate-500">
+                  ข้อมูลที่จะบันทึก: {categories.length} โซน · {totalSeats} โต๊ะ · {expenses.length} รายการรายจ่าย
+                </p>
+              </div>
+              {matchedExistingFile && (
+                <span className="px-2.5 py-1 rounded-md text-[11px] font-bold bg-emerald-50 text-emerald-800 border border-emerald-200">
+                  พบไฟล์เดิมบน Drive — จะอัปเดตทับโดยไม่สร้างไฟล์ซ้ำ
+                </span>
+              )}
+            </div>
+
+            {/* Format Selector */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <button
+                type="button"
+                onClick={() => handleFormatChange('json')}
+                disabled={isBusy}
+                className={`p-3.5 rounded-xl border-2 text-left flex items-start gap-3 transition-all cursor-pointer disabled:opacity-60 ${
+                  uploadFormat === 'json'
+                    ? 'border-blue-600 bg-blue-50/70 shadow-2xs'
+                    : 'border-slate-200 bg-slate-50 hover:border-slate-300'
+                }`}
+              >
+                <FileJson
+                  className={`w-5 h-5 shrink-0 mt-0.5 ${
+                    uploadFormat === 'json' ? 'text-blue-600' : 'text-slate-400'
+                  }`}
+                />
+                <div className="min-w-0">
+                  <p className="text-xs font-extrabold text-slate-900">
+                    JSON System Backup (.json) — แนะนำสำหรับ Sync
+                  </p>
+                  <p className="text-[11px] text-slate-600 mt-0.5">
+                    สำรองข้อมูลครบ 100% (สลิป 1-2, หมายเหตุ, สีโซน, เช็คอิน, รายจ่าย) ดึงกลับมาได้สมบูรณ์ที่สุด
+                  </p>
+                </div>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => handleFormatChange('xlsx')}
+                disabled={isBusy}
+                className={`p-3.5 rounded-xl border-2 text-left flex items-start gap-3 transition-all cursor-pointer disabled:opacity-60 ${
+                  uploadFormat === 'xlsx'
+                    ? 'border-emerald-600 bg-emerald-50/70 shadow-2xs'
+                    : 'border-slate-200 bg-slate-50 hover:border-slate-300'
+                }`}
+              >
+                <FileSpreadsheet
+                  className={`w-5 h-5 shrink-0 mt-0.5 ${
+                    uploadFormat === 'xlsx' ? 'text-emerald-600' : 'text-slate-400'
+                  }`}
+                />
+                <div className="min-w-0">
+                  <p className="text-xs font-extrabold text-slate-900">
+                    Excel Workbook (.xlsx)
+                  </p>
+                  <p className="text-[11px] text-slate-600 mt-0.5">
+                    ไฟล์ Excel แยกชีตทุกโซน + ชีตรายจ่าย + ชีตสรุปงบการเงิน เปิดใน Google Sheets/Excel ได้ทันที
+                  </p>
+                </div>
+              </button>
+            </div>
+
+            {/* Explicit Confirmation Dialog before Overwriting an Existing File on Google Drive */}
+            {pendingOverwrite && (
+              <div className="p-3.5 rounded-xl bg-amber-50 border-2 border-amber-400 flex flex-wrap items-center justify-between gap-3">
+                <div className="flex items-start gap-2.5 text-xs text-amber-950 min-w-0 flex-1">
+                  <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+                  <p className="break-words">
+                    พบไฟล์ <strong className="font-mono">{pendingOverwrite.file.name}</strong> อยู่แล้วบน Google Drive ยืนยันการอัปเดตทับไฟล์เดิม (PATCH) ด้วยข้อมูลล่าสุด หรือต้องการบันทึกเป็นไฟล์ใหม่แยกต่างหาก?
+                  </p>
+                </div>
+                <div className="flex flex-wrap items-center gap-2 shrink-0">
+                  <button
+                    type="button"
+                    onClick={() => setPendingOverwrite(null)}
+                    disabled={isUploading}
+                    className="px-3 py-1.5 text-xs font-bold text-slate-700 bg-white border border-slate-300 rounded-lg cursor-pointer"
+                  >
+                    ยกเลิก
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      executeRealDriveUpload({
+                        format: pendingOverwrite.format,
+                        targetName: getTimestampedCopyFilename(pendingOverwrite.format),
+                      })
+                    }
+                    disabled={isUploading}
+                    className="px-3 py-1.5 text-xs font-bold text-slate-800 bg-white hover:bg-slate-100 border border-slate-400 rounded-lg cursor-pointer"
+                  >
+                    สร้างเป็นไฟล์ใหม่แทน
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      executeRealDriveUpload({
+                        format: pendingOverwrite.format,
+                        targetName: pendingOverwrite.targetName,
+                        existingFileId: pendingOverwrite.file.id,
+                      })
+                    }
+                    disabled={isUploading}
+                    className="inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-bold text-white bg-amber-600 hover:bg-amber-700 disabled:opacity-50 rounded-lg cursor-pointer"
+                  >
+                    {isUploading && <RefreshCw className="w-3.5 h-3.5 animate-spin" />}
+                    ยืนยันอัปเดตไฟล์เดิม
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* Filename & Upload Actions */}
+            <div className="flex flex-col sm:flex-row gap-2.5 items-stretch sm:items-end">
+              <div className="flex-1 space-y-1">
+                <label className="block text-xs font-bold text-slate-700">
+                  ชื่อไฟล์บน Google Drive (Filename)
+                </label>
+                <input
+                  type="text"
+                  value={filename}
+                  onChange={(e) => setFilename(e.target.value)}
+                  disabled={isUploading}
+                  className="w-full px-3.5 py-2.5 text-xs sm:text-sm font-mono font-semibold text-slate-900 bg-slate-50 border-2 border-slate-300 rounded-xl focus:bg-white focus:border-slate-900 focus:outline-none disabled:opacity-60"
+                />
+              </div>
+
+              <div className="flex items-center gap-2 shrink-0">
+                <button
+                  type="button"
+                  onClick={handleSmartSaveClick}
+                  disabled={isBusy || !filename.trim()}
+                  className="inline-flex items-center justify-center gap-2 px-5 py-2.5 text-xs sm:text-sm font-extrabold text-white bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 rounded-xl shadow-sm transition-colors cursor-pointer whitespace-nowrap"
+                >
+                  {isUploading ? (
+                    <>
+                      <RefreshCw className="w-4 h-4 animate-spin" />
+                      Saving...
+                    </>
+                  ) : (
+                    <>
+                      <CloudUpload className="w-4 h-4" />
+                      {matchedExistingFile ? 'Update File on Drive' : 'Save to Google Drive'}
+                    </>
+                  )}
+                </button>
+
+                {matchedExistingFile && (
+                  <button
+                    type="button"
+                    onClick={handleSaveAsNewCopyClick}
+                    disabled={isBusy}
+                    title="สร้างไฟล์สำเนาใหม่แบบระบุวันเวลา โดยไม่ทับไฟล์เดิม"
+                    className="inline-flex items-center justify-center gap-1.5 px-3 py-2.5 text-xs font-bold text-slate-700 bg-slate-100 hover:bg-slate-200 disabled:opacity-50 border border-slate-300 rounded-xl cursor-pointer whitespace-nowrap"
+                  >
+                    <CopyPlus className="w-4 h-4" />
+                    Save Copy
+                  </button>
+                )}
+              </div>
+            </div>
+          </section>
+
+          {/* SECTION 4: Google Cloud OAuth Client ID Settings */}
+          <section className="p-4 sm:p-5 rounded-2xl bg-slate-50 border-2 border-slate-200 space-y-3">
             <div className="flex flex-wrap items-center justify-between gap-2">
               <div className="flex items-center gap-2">
                 <KeyRound className="w-4 h-4 text-slate-700" />
-                <h3 className="text-sm font-extrabold text-slate-900">
-                  1. Google Drive Settings (Google Cloud OAuth Client ID)
+                <h3 className="text-xs sm:text-sm font-extrabold text-slate-900">
+                  4. Google Cloud OAuth 2.0 Client ID Settings
                 </h3>
               </div>
               <span className="text-[11px] font-mono font-semibold text-slate-500">
@@ -404,9 +1060,9 @@ export const GoogleDriveModal: React.FC<GoogleDriveModalProps> = ({
               </span>
             </div>
 
-            <form onSubmit={handleSaveClientId} className="space-y-2.5">
+            <form onSubmit={handleSaveClientId} className="space-y-2">
               <label className="block text-xs font-semibold text-slate-600">
-                วาง Google Cloud OAuth 2.0 Client ID ของคุณ (บันทึกลง localStorage อัตโนมัติ ไม่ต้องแก้โค้ด)
+                วาง Google Cloud OAuth Client ID ของคุณ (บันทึกลง localStorage อัตโนมัติ)
               </label>
               <div className="flex flex-col sm:flex-row gap-2">
                 <input
@@ -414,11 +1070,11 @@ export const GoogleDriveModal: React.FC<GoogleDriveModalProps> = ({
                   value={clientIdInput}
                   onChange={(e) => setClientIdInput(e.target.value)}
                   placeholder="xxxxxxxxxxxx-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.apps.googleusercontent.com"
-                  className="flex-1 px-3.5 py-2.5 text-xs sm:text-sm font-mono text-slate-900 bg-white border-2 border-slate-300 rounded-xl focus:border-slate-900 focus:outline-none"
+                  className="flex-1 px-3.5 py-2 text-xs sm:text-sm font-mono text-slate-900 bg-white border-2 border-slate-300 rounded-xl focus:border-slate-900 focus:outline-none"
                 />
                 <button
                   type="submit"
-                  className="inline-flex items-center justify-center gap-1.5 px-4 py-2.5 text-xs font-bold text-white bg-slate-900 hover:bg-slate-800 rounded-xl cursor-pointer shrink-0"
+                  className="inline-flex items-center justify-center gap-1.5 px-4 py-2 text-xs font-bold text-white bg-slate-900 hover:bg-slate-800 rounded-xl cursor-pointer shrink-0"
                 >
                   {clientIdSavedNotice ? (
                     <>
@@ -432,8 +1088,7 @@ export const GoogleDriveModal: React.FC<GoogleDriveModalProps> = ({
               </div>
             </form>
 
-            {/* Authorized JavaScript Origin helper for Google Cloud Console */}
-            <div className="flex flex-wrap items-center justify-between gap-2 pt-1 text-[11px] text-slate-600">
+            <div className="flex flex-wrap items-center justify-between gap-2 pt-0.5 text-[11px] text-slate-600">
               <div className="flex flex-wrap items-center gap-1.5 min-w-0">
                 <span className="font-semibold text-slate-700">
                   Authorized JavaScript Origin:
@@ -476,342 +1131,6 @@ export const GoogleDriveModal: React.FC<GoogleDriveModalProps> = ({
               )}
             </div>
           </section>
-
-          {/* SECTION 2: Connect Google Drive (GIS OAuth 2.0) */}
-          <section className="p-4 sm:p-5 rounded-2xl bg-white border-2 border-slate-300 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-            <div className="space-y-1 min-w-0">
-              <div className="flex flex-wrap items-center gap-2">
-                <h3 className="text-sm font-extrabold text-slate-900">
-                  2. เชื่อมต่อบัญชี Google Drive
-                </h3>
-                {connectionState.connected ? (
-                  <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-md text-xs font-bold bg-emerald-100 text-emerald-800 border border-emerald-300">
-                    <CheckCircle2 className="w-3.5 h-3.5" />
-                    Connected
-                  </span>
-                ) : (
-                  <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-md text-xs font-bold bg-amber-100 text-amber-800 border border-amber-300">
-                    Not Connected
-                  </span>
-                )}
-              </div>
-              <p className="text-xs text-slate-600">
-                {connectionState.connected ? (
-                  <>
-                    เชื่อมต่อแล้ว
-                    {connectionState.user?.emailAddress
-                      ? ` ในชื่อ ${connectionState.user.displayName || ''} (${connectionState.user.emailAddress})`
-                      : ' (สิทธิ์ drive.file พร้อมอัปโหลดไฟล์ไปยัง Google Drive)'}
-                    {connectionState.expiresAt && (
-                      <span className="text-slate-500 font-mono">
-                        {' '}
-                        · หมดอายุเวลา{' '}
-                        {new Date(connectionState.expiresAt).toLocaleTimeString('th-TH')}
-                      </span>
-                    )}
-                  </>
-                ) : (
-                  <>
-                    กดปุ่มเพื่อขอสิทธิ์ OAuth 2.0 (<code className="font-mono">{DRIVE_FILE_SCOPE}</code>) ผ่าน Google Identity Services (เก็บ Token ในหน่วยความจำเท่านั้น)
-                  </>
-                )}
-              </p>
-            </div>
-
-            <div className="flex items-center gap-2 shrink-0">
-              <button
-                type="button"
-                onClick={handleConnectDrive}
-                disabled={isConnecting || !clientIdInput.trim()}
-                className="inline-flex items-center justify-center gap-2 px-4 py-2.5 text-xs font-bold text-white bg-blue-600 hover:bg-blue-700 disabled:opacity-50 rounded-xl shadow-xs transition-colors cursor-pointer whitespace-nowrap"
-              >
-                {isConnecting ? (
-                  <>
-                    <RefreshCw className="w-4 h-4 animate-spin" />
-                    Connecting...
-                  </>
-                ) : (
-                  <>
-                    <ShieldCheck className="w-4 h-4" />
-                    {connectionState.connected ? 'Reconnect Google Drive' : 'Connect Google Drive'}
-                  </>
-                )}
-              </button>
-
-              {connectionState.connected && (
-                <button
-                  type="button"
-                  onClick={handleDisconnectDrive}
-                  title="Revoke access token and disconnect"
-                  className="inline-flex items-center gap-1 px-3 py-2.5 text-xs font-bold text-red-700 bg-red-50 hover:bg-red-100 border border-red-200 rounded-xl cursor-pointer"
-                >
-                  <LogOut className="w-3.5 h-3.5" />
-                  Disconnect
-                </button>
-              )}
-            </div>
-          </section>
-
-          {/* SECTION 3: Save to Google Drive (Real Multipart Upload to Root Folder) */}
-          <section className="p-4 sm:p-5 rounded-2xl bg-white border-2 border-slate-300 space-y-4">
-            <div className="flex flex-wrap items-center justify-between gap-2">
-              <div>
-                <h3 className="text-sm font-extrabold text-slate-900">
-                  3. Save to Google Drive (อัปโหลดไฟล์จริงไปยัง Root Folder)
-                </h3>
-                <p className="text-xs text-slate-500">
-                  ข้อมูลที่จะบันทึก: {categories.length} โซน · {totalSeats} โต๊ะ · {expenses.length} รายการรายจ่าย
-                </p>
-              </div>
-            </div>
-
-            {/* Format Selector */}
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-              <button
-                type="button"
-                onClick={() => handleFormatChange('xlsx')}
-                className={`p-3.5 rounded-xl border-2 text-left flex items-start gap-3 transition-all cursor-pointer ${
-                  uploadFormat === 'xlsx'
-                    ? 'border-emerald-600 bg-emerald-50/70 shadow-2xs'
-                    : 'border-slate-200 bg-slate-50 hover:border-slate-300'
-                }`}
-              >
-                <FileSpreadsheet
-                  className={`w-5 h-5 shrink-0 mt-0.5 ${
-                    uploadFormat === 'xlsx' ? 'text-emerald-600' : 'text-slate-400'
-                  }`}
-                />
-                <div className="min-w-0">
-                  <p className="text-xs font-extrabold text-slate-900">
-                    Excel Workbook (.xlsx)
-                  </p>
-                  <p className="text-[11px] text-slate-600 mt-0.5">
-                    ไฟล์ Excel แยกชีตทุกโซน + ชีตรายจ่าย + ชีตสรุปงบการเงิน เปิดดูใน Google Sheets/Excel ได้ทันที
-                  </p>
-                </div>
-              </button>
-
-              <button
-                type="button"
-                onClick={() => handleFormatChange('json')}
-                className={`p-3.5 rounded-xl border-2 text-left flex items-start gap-3 transition-all cursor-pointer ${
-                  uploadFormat === 'json'
-                    ? 'border-blue-600 bg-blue-50/70 shadow-2xs'
-                    : 'border-slate-200 bg-slate-50 hover:border-slate-300'
-                }`}
-              >
-                <FileJson
-                  className={`w-5 h-5 shrink-0 mt-0.5 ${
-                    uploadFormat === 'json' ? 'text-blue-600' : 'text-slate-400'
-                  }`}
-                />
-                <div className="min-w-0">
-                  <p className="text-xs font-extrabold text-slate-900">
-                    JSON System Backup (.json)
-                  </p>
-                  <p className="text-[11px] text-slate-600 mt-0.5">
-                    สำรองข้อมูลทั้งระบบครบทุกฟิลด์ (รวมสลิป 1-2, หมายเหตุ, สีโซน, รายจ่าย) และกู้คืนกลับมาได้
-                  </p>
-                </div>
-              </button>
-            </div>
-
-            {/* Filename & Primary Upload Button */}
-            <div className="flex flex-col sm:flex-row gap-2.5 items-stretch sm:items-end">
-              <div className="flex-1 space-y-1">
-                <label className="block text-xs font-bold text-slate-700">
-                  ชื่อไฟล์บน Google Drive (Filename)
-                </label>
-                <input
-                  type="text"
-                  value={filename}
-                  onChange={(e) => setFilename(e.target.value)}
-                  className="w-full px-3.5 py-2.5 text-xs sm:text-sm font-mono font-semibold text-slate-900 bg-slate-50 border-2 border-slate-300 rounded-xl focus:bg-white focus:border-slate-900 focus:outline-none"
-                />
-              </div>
-
-              <button
-                type="button"
-                onClick={() => executeRealDriveUpload()}
-                disabled={isUploading || isConnecting || !filename.trim()}
-                className="inline-flex items-center justify-center gap-2 px-5 py-2.5 text-sm font-extrabold text-white bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 rounded-xl shadow-sm transition-colors cursor-pointer whitespace-nowrap"
-              >
-                {isUploading ? (
-                  <>
-                    <RefreshCw className="w-4 h-4 animate-spin" />
-                    Uploading to Google Drive...
-                  </>
-                ) : (
-                  <>
-                    <CloudUpload className="w-4 h-4" />
-                    Save to Google Drive
-                  </>
-                )}
-              </button>
-            </div>
-          </section>
-
-          {/* SECTION 4: Existing App Files on Google Drive (with Overwrite / Restore Confirmations) */}
-          {connectionState.connected && (
-            <section className="p-4 sm:p-5 rounded-2xl bg-slate-50 border-2 border-slate-200 space-y-3">
-              <div className="flex items-center justify-between gap-2">
-                <div className="flex items-center gap-2">
-                  <FolderOpen className="w-4 h-4 text-slate-700" />
-                  <h3 className="text-xs sm:text-sm font-extrabold text-slate-900">
-                    ไฟล์ที่บันทึกไว้ใน Google Drive ของคุณ ({driveFiles.length})
-                  </h3>
-                </div>
-                <button
-                  type="button"
-                  onClick={refreshDriveFiles}
-                  disabled={isLoadingFiles}
-                  className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-bold text-slate-700 bg-white hover:bg-slate-100 border border-slate-300 rounded-lg cursor-pointer"
-                >
-                  <RefreshCw className={`w-3 h-3 ${isLoadingFiles ? 'animate-spin' : ''}`} />
-                  Refresh
-                </button>
-              </div>
-
-              {/* Explicit Confirmation Dialog for Overwriting an Existing Drive File */}
-              {pendingOverwriteFile && (
-                <div className="p-3.5 rounded-xl bg-amber-50 border-2 border-amber-400 flex flex-wrap items-center justify-between gap-3">
-                  <div className="flex items-start gap-2.5 text-xs text-amber-950">
-                    <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
-                    <p>
-                      ยืนยันการเขียนทับไฟล์{' '}
-                      <strong className="font-mono">{pendingOverwriteFile.name}</strong> บน Google Drive ด้วยข้อมูลปัจจุบันใช่หรือไม่?
-                    </p>
-                  </div>
-                  <div className="flex items-center gap-2 shrink-0">
-                    <button
-                      type="button"
-                      onClick={() => setPendingOverwriteFile(null)}
-                      className="px-3 py-1.5 text-xs font-bold text-slate-700 bg-white border border-slate-300 rounded-lg cursor-pointer"
-                    >
-                      ยกเลิก
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => executeRealDriveUpload(pendingOverwriteFile.id)}
-                      disabled={isUploading}
-                      className="px-3 py-1.5 text-xs font-bold text-white bg-amber-600 hover:bg-amber-700 rounded-lg cursor-pointer"
-                    >
-                      ยืนยันเขียนทับไฟล์เดิม
-                    </button>
-                  </div>
-                </div>
-              )}
-
-              {/* Explicit Confirmation Dialog for Restoring a JSON Backup */}
-              {pendingRestoreFile && (
-                <div className="p-3.5 rounded-xl bg-blue-50 border-2 border-blue-400 flex flex-wrap items-center justify-between gap-3">
-                  <div className="flex items-start gap-2.5 text-xs text-blue-950">
-                    <AlertTriangle className="w-4 h-4 text-blue-600 shrink-0 mt-0.5" />
-                    <p>
-                      ยืนยันการกู้คืนข้อมูลจาก{' '}
-                      <strong className="font-mono">{pendingRestoreFile.name}</strong>? ข้อมูลบนหน้าจอปัจจุบันจะถูกแทนที่ด้วยไฟล์สำรองนี้
-                    </p>
-                  </div>
-                  <div className="flex items-center gap-2 shrink-0">
-                    <button
-                      type="button"
-                      onClick={() => setPendingRestoreFile(null)}
-                      className="px-3 py-1.5 text-xs font-bold text-slate-700 bg-white border border-slate-300 rounded-lg cursor-pointer"
-                    >
-                      ยกเลิก
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => handleConfirmRestore(pendingRestoreFile)}
-                      disabled={Boolean(restoringFileId)}
-                      className="px-3 py-1.5 text-xs font-bold text-white bg-blue-600 hover:bg-blue-700 rounded-lg cursor-pointer"
-                    >
-                      ยืนยันกู้คืนข้อมูล
-                    </button>
-                  </div>
-                </div>
-              )}
-
-              {isLoadingFiles ? (
-                <p className="text-xs text-slate-500 py-4 text-center">
-                  กำลังโหลดรายการไฟล์จาก Google Drive...
-                </p>
-              ) : driveFiles.length === 0 ? (
-                <p className="text-xs text-slate-500 py-4 text-center">
-                  ยังไม่มีไฟล์ที่บันทึกจากแอปนี้ กดปุ่ม &ldquo;Save to Google Drive&rdquo; ด้านบนเพื่ออัปโหลดไฟล์แรก
-                </p>
-              ) : (
-                <div className="space-y-2 max-h-56 overflow-y-auto pr-1">
-                  {driveFiles.map((file) => {
-                    const isJson =
-                      file.mimeType === 'application/json' ||
-                      file.name.toLowerCase().endsWith('.json');
-                    const isMatchingFormat =
-                      (uploadFormat === 'json' && isJson) ||
-                      (uploadFormat === 'xlsx' && !isJson);
-                    return (
-                      <div
-                        key={file.id}
-                        className="p-3 rounded-xl bg-white border border-slate-200 flex flex-wrap items-center justify-between gap-2.5"
-                      >
-                        <div className="flex items-center gap-2.5 min-w-0 flex-1">
-                          {isJson ? (
-                            <FileJson className="w-4 h-4 text-blue-600 shrink-0" />
-                          ) : (
-                            <FileSpreadsheet className="w-4 h-4 text-emerald-600 shrink-0" />
-                          )}
-                          <div className="min-w-0">
-                            <p className="text-xs font-bold text-slate-900 truncate">
-                              {file.name}
-                            </p>
-                            <p className="text-[11px] font-mono text-slate-500">
-                              {file.modifiedTime
-                                ? new Date(file.modifiedTime).toLocaleString('th-TH')
-                                : ''}
-                              {file.size ? ` · ${formatBytes(file.size)}` : ''}
-                            </p>
-                          </div>
-                        </div>
-
-                        <div className="flex items-center gap-1.5 shrink-0">
-                          {isJson && (
-                            <button
-                              type="button"
-                              onClick={() => setPendingRestoreFile(file)}
-                              disabled={restoringFileId === file.id}
-                              className="inline-flex items-center gap-1 px-2.5 py-1.5 text-[11px] font-bold text-blue-700 bg-blue-50 hover:bg-blue-100 border border-blue-200 rounded-lg cursor-pointer"
-                            >
-                              <Download className="w-3 h-3" />
-                              {restoringFileId === file.id ? 'กำลังกู้คืน...' : 'กู้คืนข้อมูล'}
-                            </button>
-                          )}
-                          {isMatchingFormat && (
-                            <button
-                              type="button"
-                              onClick={() => setPendingOverwriteFile(file)}
-                              disabled={isUploading}
-                              className="px-2.5 py-1.5 text-[11px] font-bold text-amber-800 bg-amber-50 hover:bg-amber-100 border border-amber-200 rounded-lg cursor-pointer"
-                            >
-                              อัปเดตทับไฟล์นี้
-                            </button>
-                          )}
-                          <a
-                            href={file.webViewLink}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="inline-flex items-center gap-1 px-2.5 py-1.5 text-[11px] font-bold text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-lg"
-                          >
-                            <ExternalLink className="w-3 h-3" />
-                            เปิดใน Drive
-                          </a>
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-            </section>
-          )}
         </div>
       </div>
     </div>

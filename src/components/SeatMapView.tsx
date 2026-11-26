@@ -11,6 +11,7 @@ import {
   Plus,
   Ticket,
   StickyNote,
+  ArrowRightLeft,
 } from 'lucide-react';
 import { CategoryConfig, SeatRecord } from '../types/booking';
 import { buildUpdatedSeatRecord } from '../utils/excelTemplate';
@@ -27,6 +28,7 @@ interface SeatMapViewProps {
   onDeleteRecord?: (recordId: string) => void;
   onAddRecord?: (categoryId: string, record: SeatRecord) => void;
   onAddMultipleRecords?: (categoryId: string, records: SeatRecord[]) => void;
+  onRequestMoveTable?: (record?: SeatRecord) => void;
 }
 
 type StatusFilter =
@@ -49,6 +51,7 @@ export const SeatMapView: React.FC<SeatMapViewProps> = ({
   onDeleteRecord,
   onAddRecord,
   onAddMultipleRecords,
+  onRequestMoveTable,
 }) => {
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedCategory, setSelectedCategory] = useState<string>(initialCategoryFilter);
@@ -194,6 +197,16 @@ export const SeatMapView: React.FC<SeatMapViewProps> = ({
 
           {/* Sort Mode Toggle & Add Table Button */}
           <div className="flex flex-wrap items-center gap-2">
+            {onRequestMoveTable && (
+              <button
+                type="button"
+                onClick={() => onRequestMoveTable()}
+                className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-bold text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer shadow-2xs"
+              >
+                <ArrowRightLeft className="w-4 h-4" />
+                ย้าย / สลับโต๊ะ
+              </button>
+            )}
             {onAddRecord && (
               <button
                 type="button"
@@ -638,6 +651,9 @@ export const SeatMapView: React.FC<SeatMapViewProps> = ({
         categoryColorMap={categoryColorMap}
         onUpdateRecord={onUpdateRecord}
         onDeleteRecord={onDeleteRecord}
+        onRequestMoveTable={
+          onRequestMoveTable ? (rec) => onRequestMoveTable(rec) : undefined
+        }
         onClose={() => setActiveSeatId(null)}
       />
 

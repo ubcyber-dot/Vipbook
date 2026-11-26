@@ -14,6 +14,7 @@ interface SeatDetailModalProps {
   onUpdateRecord?: (updated: SeatRecord) => void;
   onDeleteRecord?: (recordId: string) => void;
   onRequestAddTable?: (prefillTableNumber?: string) => void;
+  onRequestMoveTable?: (record: SeatRecord) => void;
   defaultEditing?: boolean;
   onClose: () => void;
 }
@@ -29,6 +30,7 @@ export const SeatDetailModal: React.FC<SeatDetailModalProps> = ({
   onUpdateRecord,
   onDeleteRecord,
   onRequestAddTable,
+  onRequestMoveTable,
   defaultEditing = false,
   onClose,
 }) => {
@@ -143,6 +145,14 @@ export const SeatDetailModal: React.FC<SeatDetailModalProps> = ({
                           ? (id) => {
                               onDeleteRecord(id);
                               if (activeRecords.length <= 1) onClose();
+                            }
+                          : undefined
+                      }
+                      onRequestMoveTable={
+                        onRequestMoveTable
+                          ? (rec) => {
+                              onClose();
+                              onRequestMoveTable(rec);
                             }
                           : undefined
                       }

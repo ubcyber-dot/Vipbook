@@ -25,6 +25,7 @@ import {
   listDriveSpreadsheets,
   TemplateSheetPayload,
 } from '../services/sheetsApi';
+import { normalizeHexColor } from '../utils/excelTemplate';
 import { ExcelTemplateImporter } from './ExcelTemplateImporter';
 
 interface SettingsModalProps {
@@ -106,20 +107,23 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const [newCatColor, setNewCatColor] = useState('#7C3AED');
 
   useEffect(() => {
+    if (!isOpen) return;
     setSelectedDriveId(spreadsheetId === 'template-import' ? '' : spreadsheetId);
-  }, [spreadsheetId]);
-
-  useEffect(() => {
     setLocalCategories(categories);
-  }, [categories]);
-
-  useEffect(() => {
     setDetectedSheets(availableSheets);
-  }, [availableSheets]);
+    setDetectedTitle(spreadsheetTitle);
+  }, [isOpen, spreadsheetId, categories, availableSheets, spreadsheetTitle]);
 
   useEffect(() => {
-    setDetectedTitle(spreadsheetTitle);
-  }, [spreadsheetTitle]);
+    if (!isOpen) return;
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        onClose();
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [isOpen, onClose]);
 
   const loadDriveFiles = async (query = '', mode: DriveFilterMode = driveFilter) => {
     if (!isAuthenticated) return;
@@ -192,7 +196,19 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
   const handleApplyAndSave = (e: React.FormEvent) => {
     e.preventDefault();
-    onSaveConfig(selectedDriveId || spreadsheetId, localCategories);
+    const sanitized = localCategories.map((cat) => {
+      const fallbackColor =
+        cat.id === 'vip' || cat.name.toLowerCase().includes('vip')
+          ? '#D97706'
+          : '#2563EB';
+      return {
+        ...cat,
+        name: cat.name.trim() || cat.id,
+        sheetName: cat.sheetName.trim() || cat.name.trim() || cat.id,
+        colorHex: normalizeHexColor(cat.colorHex, fallbackColor),
+      };
+    });
+    onSaveConfig(selectedDriveId || spreadsheetId, sanitized);
     onClose();
   };
 
@@ -436,7 +452,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               <button
                 type="button"
                 onClick={() => {
-                  onResetColors();
                   setLocalCategories((prev) =>
                     prev.map((c) => {
                       if (c.id === 'vip') return { ...c, colorHex: '#D97706' };
@@ -517,9 +532,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     <div className="flex items-center gap-2.5">
                       <input
                         type="color"
-                        value={cat.colorHex}
+                        value={normalizeHexColor(cat.colorHex, '#2563EB')}
                         onChange={(e) =>
-                          handleCategoryChange(cat.id, 'colorHex', e.target.value)
+                          handleCategoryChange(cat.id, 'colorHex', e.target.value.toUpperCase())
                         }
                         className="w-10 h-10 rounded-lg border border-slate-300 cursor-pointer p-0.5 bg-white shrink-0"
                       />
@@ -529,11 +544,18 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                         onChange={(e) =>
                           handleCategoryChange(cat.id, 'colorHex', e.target.value)
                         }
+                        onBlur={(e) =>
+                          handleCategoryChange(
+                            cat.id,
+                            'colorHex',
+                            normalizeHexColor(e.target.value, '#2563EB')
+                          )
+                        }
                         className="w-24 px-2.5 py-2 text-xs font-mono uppercase bg-white border border-slate-300 rounded-lg"
                       />
                       <span
                         className="px-2.5 py-1.5 rounded-md text-xs font-bold text-white whitespace-nowrap shrink-0"
-                        style={{ backgroundColor: cat.colorHex }}
+                        style={{ backgroundColor: normalizeHexColor(cat.colorHex, '#2563EB') }}
                       >
                         ตัวอย่าง {cat.name}
                       </span>

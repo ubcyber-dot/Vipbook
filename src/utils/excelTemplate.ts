@@ -7,7 +7,12 @@ import {
   SeatRecord,
   SheetColumnMap,
 } from '../types/booking';
-import { BatchReadResponse, TemplateSheetPayload } from '../services/sheetsApi';
+import {
+  BatchReadResponse,
+  CloudSystemState,
+  TemplateSheetPayload,
+} from '../services/sheetsApi';
+import { sanitizeSafeUrl } from './media';
 
 export const STANDARD_TEMPLATE_HEADERS = [
   'เลขโต๊ะ',
@@ -1038,11 +1043,13 @@ export function parseExpensesFromWorkbook(workbook: ParsedExcelWorkbook): Expens
 }
 
 /**
- * Parses an uploaded Excel (.xlsx, .xls) or CSV file into structured sheets,
+ * Parses raw Excel (.xlsx, .xls) or CSV binary bytes into structured sheets,
  * preserving formatted display values, dates, hyperlinks, and formulas.
  */
-export async function parseExcelWorkbookFile(file: File): Promise<ParsedExcelWorkbook> {
-  const buffer = await file.arrayBuffer();
+export function parseExcelWorkbookBuffer(
+  buffer: ArrayBuffer | Uint8Array,
+  fileName: string
+): ParsedExcelWorkbook {
   const wb = XLSX.read(buffer, {
     type: 'array',
     cellFormula: true,
@@ -1134,9 +1141,379 @@ export async function parseExcelWorkbookFile(file: File): Promise<ParsedExcelWor
   }
 
   return {
-    fileName: file.name,
+    fileName,
     sheetNames: wb.SheetNames,
     sheets,
   };
 }
+
+/**
+ * Parses an uploaded Excel (.xlsx, .xls) or CSV file into structured sheets,
+ * preserving formatted display values, dates, hyperlinks, and formulas.
+ */
+export async function parseExcelWorkbookFile(file: File): Promise<ParsedExcelWorkbook> {
+  const buffer = await file.arrayBuffer();
+  return parseExcelWorkbookBuffer(buffer, file.name);
+}
+
+/**
+ * Normalizes a hex color string to a valid #RRGGBB format.
+ */
+export function normalizeHexColor(raw: unknown, fallback = '#2563EB'): string {
+  const str = String(raw ?? '').trim();
+  if (/^#[0-9a-fA-F]{6}$/.test(str)) {
+    return str.toUpperCase();
+  }
+  if (/^#[0-9a-fA-F]{3}$/.test(str)) {
+    const r = str[1];
+    const g = str[2];
+    const b = str[3];
+    return `#${r}${r}${g}${g}${b}${b}`.toUpperCase();
+  }
+  return fallback;
+}
+
+const VALID_EXPENSE_CATEGORY_IDS = new Set<ExpenseCategoryId>([
+  'venue',
+  'food',
+  'equipment',
+  'staff',
+  'marketing',
+  'other',
+]);
+
+const FALLBACK_DEFAULT_CATEGORIES: CategoryConfig[] = [
+  { id: 'vip', name: 'VIP', sheetName: 'VIP', colorHex: '#D97706', isDefault: true },
+  {
+    id: 'standard',
+    name: 'Standard',
+    sheetName: 'Standard',
+    colorHex: '#2563EB',
+    isDefault: true,
+  },
+];
+
+/**
+ * Strictly validates and sanitizes a JSON backup payload loaded from Google Drive
+ * so malformed, partial, or empty fields never crash the UI.
+ */
+export function validateAndHydrateCloudState(
+  raw: unknown,
+  fallbackCategories: CategoryConfig[] = FALLBACK_DEFAULT_CATEGORIES
+): CloudSystemState {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new Error(
+      'รูปแบบไฟล์สำรอง JSON ไม่ถูกต้อง (ข้อมูลต้องเป็นออบเจ็กต์ JSON ของระบบจองโต๊ะ)'
+    );
+  }
+
+  const obj = raw as Record<string, unknown>;
+  const hasCategoryResults = Array.isArray(obj.categoryResults);
+  const hasCategories = Array.isArray(obj.categories);
+  const hasExpenses = Array.isArray(obj.expenses);
+
+  if (!hasCategoryResults && !hasCategories && !hasExpenses) {
+    throw new Error(
+      'ไฟล์ JSON นี้ไม่ตรงกับโครงสร้างข้อมูลของระบบจองโต๊ะ (ไม่พบ categoryResults, categories หรือ expenses)'
+    );
+  }
+
+  // 1. Validate & sanitize categories
+  const rawCats = Array.isArray(obj.categories) ? obj.categories : [];
+  const seenCatIds = new Set<string>();
+  const sanitizedCategories: CategoryConfig[] = [];
+
+  for (let i = 0; i < rawCats.length; i++) {
+    const item = rawCats[i];
+    if (!item || typeof item !== 'object') continue;
+    const c = item as Record<string, unknown>;
+    const rawId = String(c.id ?? '').trim() || `cat-${i + 1}`;
+    if (seenCatIds.has(rawId)) continue;
+    seenCatIds.add(rawId);
+
+    const name = String(c.name ?? '').trim() || rawId;
+    const sheetName = String(c.sheetName ?? '').trim() || name;
+    const defaultFallbackColor =
+      rawId === 'vip' || name.toLowerCase().includes('vip') ? '#D97706' : '#2563EB';
+    sanitizedCategories.push({
+      id: rawId,
+      name,
+      sheetName,
+      colorHex: normalizeHexColor(c.colorHex, defaultFallbackColor),
+      isDefault: Boolean(c.isDefault || rawId === 'vip' || rawId === 'standard'),
+    });
+  }
+
+  const finalCategories =
+    sanitizedCategories.length > 0
+      ? sanitizedCategories
+      : fallbackCategories.length > 0
+      ? fallbackCategories
+      : FALLBACK_DEFAULT_CATEGORIES;
+
+  // 2. Validate & sanitize categoryResults & every SeatRecord
+  const rawResults = Array.isArray(obj.categoryResults) ? obj.categoryResults : [];
+  const rawResultByCatId = new Map<string, Record<string, unknown>>();
+  for (const item of rawResults) {
+    if (item && typeof item === 'object') {
+      const recObj = item as Record<string, unknown>;
+      const catId = String(recObj.categoryId ?? '').trim();
+      if (catId && !rawResultByCatId.has(catId)) {
+        rawResultByCatId.set(catId, recObj);
+      }
+    }
+  }
+
+  const defaultColMap = resolveColumnMapFromRow(STANDARD_TEMPLATE_HEADERS).columnMap;
+  const sanitizedCategoryResults: CategorySheetResult[] = finalCategories.map((cat) => {
+    const rawCatRes = rawResultByCatId.get(cat.id);
+    const rawRecords = Array.isArray(rawCatRes?.records) ? rawCatRes.records : [];
+    const seenRecIds = new Set<string>();
+    const cleanRecords: SeatRecord[] = [];
+
+    for (let idx = 0; idx < rawRecords.length; idx++) {
+      const recItem = rawRecords[idx];
+      if (!recItem || typeof recItem !== 'object') continue;
+      const r = recItem as Record<string, unknown>;
+      const tableNo =
+        String(r.tableNumber ?? '').trim() || `แถวที่ ${idx + 2}`;
+      const normTable = normalizeTableNo(tableNo);
+      let recId =
+        String(r.id ?? '').trim() || `${cat.id}-row-${idx + 2}-${normTable}`;
+      if (seenRecIds.has(recId)) {
+        recId = `${recId}-${idx}`;
+      }
+      seenRecIds.add(recId);
+
+      const parsedAmount = parseTransferAmount(
+        r.transferAmount !== undefined ? r.transferAmount : r.rawTransferAmount
+      );
+      const isPaid =
+        typeof r.isPaid === 'boolean'
+          ? r.isPaid
+          : evaluatePaidStatus(r.rawPaidStatus);
+      const isCheckedIn =
+        typeof r.isCheckedIn === 'boolean'
+          ? r.isCheckedIn
+          : evaluateCheckedInStatus(r.isCheckedIn);
+      const isTicketCollected =
+        typeof r.isTicketCollected === 'boolean'
+          ? r.isTicketCollected
+          : evaluateTicketCollectedStatus(r.isTicketCollected);
+
+      const baseRecord: SeatRecord = {
+        id: recId,
+        rowNumber: Number.isFinite(Number(r.rowNumber))
+          ? Math.max(1, Math.floor(Number(r.rowNumber)))
+          : idx + 2,
+        categoryId: cat.id,
+        categoryName: cat.name,
+        sheetName: String(rawCatRes?.sheetName ?? '').trim() || cat.sheetName,
+        tableNumber: tableNo,
+        normalizedTableNumber: normTable,
+        compactTableNumber: compactTableNo(tableNo),
+        fullName: String(r.fullName ?? '').trim(),
+        phone: String(r.phone ?? '').trim(),
+        transferAmount: parsedAmount,
+        rawTransferAmount:
+          r.rawTransferAmount !== undefined
+            ? String(r.rawTransferAmount)
+            : parsedAmount > 0
+            ? String(parsedAmount)
+            : '',
+        transferDate: String(r.transferDate ?? '').trim(),
+        slipUrl: sanitizeSafeUrl(String(r.slipUrl ?? '')),
+        slipUrl2: sanitizeSafeUrl(String(r.slipUrl2 ?? '')),
+        rawPaidStatus: isPaid ? 'TRUE' : 'FALSE',
+        isPaid,
+        isBooked: Boolean(r.isBooked),
+        isCheckedIn,
+        checkedInAt: String(r.checkedInAt ?? '').trim(),
+        isTicketCollected,
+        ticketCollectedAt: String(r.ticketCollectedAt ?? '').trim(),
+        note: String(r.note ?? '').trim(),
+      };
+
+      cleanRecords.push(buildUpdatedSeatRecord(baseRecord, {}));
+    }
+
+    return {
+      categoryId: cat.id,
+      categoryName: cat.name,
+      sheetName: String(rawCatRes?.sheetName ?? '').trim() || cat.sheetName,
+      foundSheet: rawCatRes ? rawCatRes.foundSheet !== false : true,
+      columnMap:
+        rawCatRes?.columnMap && typeof rawCatRes.columnMap === 'object'
+          ? (rawCatRes.columnMap as SheetColumnMap)
+          : defaultColMap,
+      records: cleanRecords,
+      error: typeof rawCatRes?.error === 'string' ? rawCatRes.error : undefined,
+    };
+  });
+
+  // 3. Validate & sanitize expenses
+  const rawExpenses = Array.isArray(obj.expenses) ? obj.expenses : [];
+  const seenExpenseIds = new Set<string>();
+  const sanitizedExpenses: ExpenseRecord[] = [];
+
+  for (let idx = 0; idx < rawExpenses.length; idx++) {
+    const item = rawExpenses[idx];
+    if (!item || typeof item !== 'object') continue;
+    const e = item as Record<string, unknown>;
+    const title = String(e.title ?? '').trim();
+    const amount = Math.max(0, parseTransferAmount(e.amount));
+    if (!title && amount <= 0) continue;
+
+    let expId = String(e.id ?? '').trim() || `exp-restored-${Date.now()}-${idx}`;
+    if (seenExpenseIds.has(expId)) {
+      expId = `${expId}-${idx}`;
+    }
+    seenExpenseIds.add(expId);
+
+    const rawCatId = String(e.category ?? '').trim() as ExpenseCategoryId;
+    const resolvedCat = VALID_EXPENSE_CATEGORY_IDS.has(rawCatId)
+      ? { id: rawCatId, label: getExpenseCategoryLabel(rawCatId) }
+      : matchExpenseCategoryByText(String(e.categoryLabel ?? rawCatId));
+
+    sanitizedExpenses.push({
+      id: expId,
+      expenseDate: String(e.expenseDate ?? '').trim() || new Date().toLocaleDateString('th-TH'),
+      title: title || `รายการค่าใช้จ่ายที่ ${idx + 1}`,
+      category: resolvedCat.id,
+      categoryLabel: String(e.categoryLabel ?? '').trim() || resolvedCat.label,
+      amount,
+      payeeOrNote: String(e.payeeOrNote ?? '').trim(),
+      receiptUrl: sanitizeSafeUrl(String(e.receiptUrl ?? '')),
+      createdAt:
+        typeof e.createdAt === 'string' && e.createdAt.trim()
+          ? e.createdAt
+          : new Date().toISOString(),
+    });
+  }
+
+  const availableSheets = Array.isArray(obj.availableSheets)
+    ? obj.availableSheets.map((s) => String(s ?? '').trim()).filter(Boolean)
+    : finalCategories.map((c) => c.sheetName);
+
+  return {
+    categories: finalCategories,
+    categoryResults: sanitizedCategoryResults,
+    expenses: sanitizedExpenses,
+    spreadsheetTitle:
+      String(obj.spreadsheetTitle ?? '').trim() || 'ข้อมูลระบบจองโต๊ะ VIP & Standard',
+    availableSheets,
+    updatedAt:
+      typeof obj.updatedAt === 'string' && obj.updatedAt.trim()
+        ? obj.updatedAt
+        : new Date().toISOString(),
+  };
+}
+
+/**
+ * Hydrates a CloudSystemState directly from an .xlsx workbook downloaded from Google Drive.
+ */
+export function buildCloudSystemStateFromExcelBuffer(
+  buffer: ArrayBuffer | Uint8Array,
+  fileName: string,
+  fallbackCategories: CategoryConfig[] = FALLBACK_DEFAULT_CATEGORIES
+): CloudSystemState {
+  const parsed = parseExcelWorkbookBuffer(buffer, fileName);
+  if (!parsed.sheetNames.length) {
+    throw new Error(`ไฟล์ Excel "${fileName}" ไม่มีแผ่นงานข้อมูล`);
+  }
+
+  const nonSeatSheetCheck = (name: string) => {
+    const n = normalizeHeader(name);
+    return (
+      n.includes('รายจ่าย') ||
+      n.includes('ค่าใช้จ่าย') ||
+      n.includes('expense') ||
+      n.includes('สรุปงบ') ||
+      n.includes('summary')
+    );
+  };
+
+  const seatSheets = parsed.sheetNames.filter((s) => !nonSeatSheetCheck(s));
+  const usedSheets = new Set<string>();
+  const targetCategories: CategoryConfig[] = [];
+  const payloads: TemplateSheetPayload[] = [];
+
+  for (const cat of fallbackCategories) {
+    const desired = normalizeHeader(cat.sheetName || cat.name);
+    const matched =
+      seatSheets.find(
+        (s) => !usedSheets.has(s) && normalizeHeader(s) === desired
+      ) ||
+      seatSheets.find(
+        (s) =>
+          !usedSheets.has(s) &&
+          (normalizeHeader(s).includes(desired) ||
+            desired.includes(normalizeHeader(s)))
+      );
+
+    if (matched && parsed.sheets[matched]) {
+      usedSheets.add(matched);
+      targetCategories.push({ ...cat, sheetName: matched });
+      payloads.push({
+        categoryId: cat.id,
+        categoryName: cat.name,
+        sheetName: matched,
+        rows: parsed.sheets[matched].rows,
+        formulaRows: parsed.sheets[matched].formulaRows,
+        fileName,
+      });
+    }
+  }
+
+  // Include any additional seat sheets that were not in fallbackCategories
+  const extraColors = ['#7C3AED', '#0891B2', '#0D9488', '#DB2777', '#4F46E5'];
+  let extraIdx = 0;
+  for (const sheetName of seatSheets) {
+    if (usedSheets.has(sheetName)) continue;
+    const sheetData = parsed.sheets[sheetName];
+    if (!sheetData) continue;
+    const newId = `cat-drive-${normalizeHeader(sheetName) || extraIdx}`;
+    const colorHex = extraColors[extraIdx % extraColors.length];
+    extraIdx++;
+    targetCategories.push({
+      id: newId,
+      name: sheetName,
+      sheetName,
+      colorHex,
+      isDefault: false,
+    });
+    payloads.push({
+      categoryId: newId,
+      categoryName: sheetName,
+      sheetName,
+      rows: sheetData.rows,
+      formulaRows: sheetData.formulaRows,
+      fileName,
+    });
+  }
+
+  const finalCategories =
+    targetCategories.length > 0 ? targetCategories : fallbackCategories;
+
+  const batch = buildBatchReadResponseFromSheets(
+    finalCategories,
+    payloads,
+    `กู้คืนจาก Google Drive (${fileName})`,
+    parsed.sheetNames
+  );
+  const importedExpenses = parseExpensesFromWorkbook(parsed);
+
+  return validateAndHydrateCloudState(
+    {
+      categories: finalCategories,
+      categoryResults: batch.categoryResults,
+      expenses: importedExpenses,
+      spreadsheetTitle: batch.spreadsheetTitle,
+      availableSheets: batch.availableSheets,
+      updatedAt: new Date().toISOString(),
+    },
+    finalCategories
+  );
+}
+
 

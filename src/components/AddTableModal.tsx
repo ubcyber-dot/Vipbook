@@ -121,8 +121,8 @@ export const AddTableModal: React.FC<AddTableModalProps> = ({
 
   // Batch Range Form State
   const [batchPrefix, setBatchPrefix] = useState<string>('VIP-');
-  const [batchStart, setBatchStart] = useState<number>(21);
-  const [batchEnd, setBatchEnd] = useState<number>(30);
+  const [batchStartStr, setBatchStartStr] = useState<string>('21');
+  const [batchEndStr, setBatchEndStr] = useState<string>('30');
   const [batchPadLength, setBatchPadLength] = useState<number>(2);
   const [batchMarkAsBooked, setBatchMarkAsBooked] = useState<boolean>(false);
   const [batchNote, setBatchNote] = useState<string>('');
@@ -185,8 +185,8 @@ export const AddTableModal: React.FC<AddTableModalProps> = ({
       setTableNumber(pattern.suggestedNextTable);
     }
     setBatchPrefix(pattern.detectedPrefix);
-    setBatchStart(pattern.nextNumber);
-    setBatchEnd(pattern.nextNumber + 9);
+    setBatchStartStr(String(pattern.nextNumber));
+    setBatchEndStr(String(pattern.nextNumber + 9));
     setBatchPadLength(pattern.padLength);
   }, [isOpen, initialTableNumber, pattern]);
 
@@ -217,8 +217,13 @@ export const AddTableModal: React.FC<AddTableModalProps> = ({
 
   // Calculate Batch Preview
   const batchPreview = useMemo(() => {
-    const start = Math.max(1, Math.floor(Number(batchStart) || 1));
-    const end = Math.max(start, Math.min(start + 199, Math.floor(Number(batchEnd) || start)));
+    const parsedStart = Number(batchStartStr);
+    const parsedEnd = Number(batchEndStr);
+    const start = Number.isFinite(parsedStart) && parsedStart >= 1 ? Math.floor(parsedStart) : 1;
+    const end =
+      Number.isFinite(parsedEnd) && parsedEnd >= start
+        ? Math.min(start + 199, Math.floor(parsedEnd))
+        : start;
     const existingNormSet = new Set(zoneRecords.map((r) => r.normalizedTableNumber));
 
     const toCreate: string[] = [];
@@ -243,7 +248,7 @@ export const AddTableModal: React.FC<AddTableModalProps> = ({
       start,
       end,
     };
-  }, [batchPrefix, batchStart, batchEnd, batchPadLength, zoneRecords]);
+  }, [batchPrefix, batchStartStr, batchEndStr, batchPadLength, zoneRecords]);
 
   if (!isOpen) return null;
 
@@ -838,8 +843,8 @@ export const AddTableModal: React.FC<AddTableModalProps> = ({
                         min="1"
                         max="9999"
                         required
-                        value={batchStart}
-                        onChange={(e) => setBatchStart(Number(e.target.value))}
+                        value={batchStartStr}
+                        onChange={(e) => setBatchStartStr(e.target.value)}
                         className="w-full px-3 py-2 text-sm font-mono font-bold bg-slate-50 border-2 border-slate-300 rounded-xl focus:bg-white focus:border-slate-900 focus:outline-none"
                       />
                     </div>
@@ -850,11 +855,11 @@ export const AddTableModal: React.FC<AddTableModalProps> = ({
                       </label>
                       <input
                         type="number"
-                        min={batchStart}
-                        max={batchStart + 199}
+                        min={batchPreview.start}
+                        max={batchPreview.start + 199}
                         required
-                        value={batchEnd}
-                        onChange={(e) => setBatchEnd(Number(e.target.value))}
+                        value={batchEndStr}
+                        onChange={(e) => setBatchEndStr(e.target.value)}
                         className="w-full px-3 py-2 text-sm font-mono font-bold bg-slate-50 border-2 border-slate-300 rounded-xl focus:bg-white focus:border-slate-900 focus:outline-none"
                       />
                     </div>

@@ -9,6 +9,7 @@ import {
   XCircle,
   Maximize2,
   Plus,
+  ArrowRightLeft,
 } from 'lucide-react';
 import { CategoryConfig, SeatRecord } from '../types/booking';
 import { BookingCard } from './BookingCard';
@@ -26,6 +27,7 @@ interface LookupViewProps {
   onDeleteRecord?: (recordId: string) => void;
   onAddRecord?: (categoryId: string, record: SeatRecord) => void;
   onAddMultipleRecords?: (categoryId: string, records: SeatRecord[]) => void;
+  onRequestMoveTable?: (record?: SeatRecord) => void;
 }
 
 function normalizeQuery(input: string): string {
@@ -52,6 +54,7 @@ export const LookupView: React.FC<LookupViewProps> = ({
   onDeleteRecord,
   onAddRecord,
   onAddMultipleRecords,
+  onRequestMoveTable,
 }) => {
   const [inputValue, setInputValue] = useState('');
   const [submittedQuery, setSubmittedQuery] = useState('');
@@ -243,6 +246,16 @@ export const LookupView: React.FC<LookupViewProps> = ({
                   อัปเดตล่าสุด: {new Date(lastSyncedAt).toLocaleTimeString('th-TH')}
                 </span>
               )}
+              {onRequestMoveTable && (
+                <button
+                  type="button"
+                  onClick={() => onRequestMoveTable()}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-bold text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer shadow-2xs"
+                >
+                  <ArrowRightLeft className="w-3.5 h-3.5" />
+                  ย้าย / สลับโต๊ะ
+                </button>
+              )}
               {onAddRecord && (
                 <button
                   type="button"
@@ -399,6 +412,9 @@ export const LookupView: React.FC<LookupViewProps> = ({
                       categoryColor={categoryColorMap[record.categoryId] || '#2563EB'}
                       onUpdateRecord={onUpdateRecord}
                       onDeleteRecord={onDeleteRecord}
+                      onRequestMoveTable={
+                        onRequestMoveTable ? (rec) => onRequestMoveTable(rec) : undefined
+                      }
                     />
                   </div>
                 ))}
@@ -456,6 +472,9 @@ export const LookupView: React.FC<LookupViewProps> = ({
                       categoryColor={categoryColorMap[record.categoryId] || '#2563EB'}
                       onUpdateRecord={onUpdateRecord}
                       onDeleteRecord={onDeleteRecord}
+                      onRequestMoveTable={
+                        onRequestMoveTable ? (rec) => onRequestMoveTable(rec) : undefined
+                      }
                     />
                   </div>
                 ))}
@@ -555,6 +574,9 @@ export const LookupView: React.FC<LookupViewProps> = ({
         categoryNames={categories.map((c) => c.name)}
         onUpdateRecord={onUpdateRecord}
         onDeleteRecord={onDeleteRecord}
+        onRequestMoveTable={
+          onRequestMoveTable ? (rec) => onRequestMoveTable(rec) : undefined
+        }
         onRequestAddTable={
           onAddRecord
             ? (prefillNo) => handleOpenAddModal(undefined, prefillNo || '')

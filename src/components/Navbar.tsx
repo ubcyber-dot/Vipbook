@@ -2,9 +2,10 @@ import React from 'react';
 import {
   Cloud,
   CloudUpload,
-  CheckCircle2,
+  CloudDownload,
   RefreshCw,
   Settings,
+  LogOut,
 } from 'lucide-react';
 import { ActiveTab } from '../types/booking';
 
@@ -14,9 +15,14 @@ interface NavbarProps {
   onOpenSettings: () => void;
   onOpenDriveModal: () => void;
   isDriveConnected: boolean;
+  isDriveNeedsReauth?: boolean;
   driveUserLabel?: string | null;
+  isDriveConnecting?: boolean;
   isDriveUploading?: boolean;
+  isDriveLoadingBackup?: boolean;
   onConnectOrSaveDrive: () => void;
+  onLoadFromDrive: () => void;
+  onDisconnectDrive: () => void;
 }
 
 export const Navbar: React.FC<NavbarProps> = ({
@@ -25,10 +31,17 @@ export const Navbar: React.FC<NavbarProps> = ({
   onOpenSettings,
   onOpenDriveModal,
   isDriveConnected,
+  isDriveNeedsReauth = false,
   driveUserLabel,
+  isDriveConnecting = false,
   isDriveUploading = false,
+  isDriveLoadingBackup = false,
   onConnectOrSaveDrive,
+  onLoadFromDrive,
+  onDisconnectDrive,
 }) => {
+  const isBusy = isDriveConnecting || isDriveUploading || isDriveLoadingBackup;
+
   return (
     <header className="sticky top-0 z-30 bg-white border-b-2 border-slate-300 px-4 sm:px-6 py-3 shadow-2xs">
       <div className="max-w-7xl mx-auto flex flex-wrap items-center justify-between gap-4">
@@ -99,44 +112,76 @@ export const Navbar: React.FC<NavbarProps> = ({
           </button>
         </nav>
 
-        {/* Zone 3: Real Google Drive GIS Connection & Settings Actions */}
-        <div className="flex items-center gap-2 shrink-0">
+        {/* Zone 3: Real Google Drive GIS Persistent Session Actions */}
+        <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
           <button
             type="button"
             onClick={onOpenDriveModal}
-            title="Google Drive Settings (Client ID & Upload Options)"
-            className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold text-slate-700 bg-slate-100 hover:bg-slate-200 border border-slate-300 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+            title="Google Drive Settings, Backups & Client ID"
+            className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-bold text-slate-700 bg-slate-100 hover:bg-slate-200 border border-slate-300 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
           >
             <Settings className="w-3.5 h-3.5" />
-            <span>Drive Settings</span>
+            <span className="hidden sm:inline">Drive</span>
           </button>
+
+          {isDriveConnected && (
+            <button
+              type="button"
+              onClick={onLoadFromDrive}
+              disabled={isBusy}
+              title="ดึงข้อมูลล่าสุดจาก Google Drive"
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold text-blue-700 bg-blue-50 hover:bg-blue-100 disabled:opacity-60 border border-blue-200 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+            >
+              {isDriveLoadingBackup ? (
+                <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+              ) : (
+                <CloudDownload className="w-3.5 h-3.5" />
+              )}
+              <span>{isDriveLoadingBackup ? 'Loading...' : 'Load'}</span>
+            </button>
+          )}
 
           <button
             type="button"
             onClick={onConnectOrSaveDrive}
-            disabled={isDriveUploading}
+            disabled={isBusy}
             title={
               isDriveConnected
-                ? `Connected to Google Drive${driveUserLabel ? ` (${driveUserLabel})` : ''} — Click to Save to Google Drive`
-                : 'Connect Google Drive via Google Identity Services (OAuth 2.0)'
+                ? isDriveNeedsReauth
+                  ? 'เซสชันหมดอายุ — คลิกเพื่อเชื่อมต่อ Google Drive อีกครั้ง'
+                  : `เชื่อมต่อแล้ว${driveUserLabel ? ` (${driveUserLabel})` : ''} — คลิกเพื่อบันทึกข้อมูลขึ้น Google Drive`
+                : 'เชื่อมต่อบัญชี Google Drive ผ่าน OAuth 2.0'
             }
             className={`inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-bold text-white rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-60 ${
               isDriveConnected
-                ? 'bg-emerald-600 hover:bg-emerald-700'
+                ? isDriveNeedsReauth
+                  ? 'bg-amber-600 hover:bg-amber-700'
+                  : 'bg-emerald-600 hover:bg-emerald-700'
                 : 'bg-blue-600 hover:bg-blue-700'
             }`}
           >
             {isDriveUploading ? (
               <>
                 <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                <span>Uploading...</span>
+                <span>Saving...</span>
+              </>
+            ) : isDriveConnecting ? (
+              <>
+                <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                <span>Connecting...</span>
               </>
             ) : isDriveConnected ? (
-              <>
-                <CloudUpload className="w-3.5 h-3.5" />
-                <span>Save to Google Drive</span>
-                <CheckCircle2 className="w-3.5 h-3.5 text-emerald-200" />
-              </>
+              isDriveNeedsReauth ? (
+                <>
+                  <Cloud className="w-3.5 h-3.5" />
+                  <span>Reconnect Drive</span>
+                </>
+              ) : (
+                <>
+                  <CloudUpload className="w-3.5 h-3.5" />
+                  <span>Save to Drive</span>
+                </>
+              )
             ) : (
               <>
                 <Cloud className="w-3.5 h-3.5" />
@@ -144,6 +189,19 @@ export const Navbar: React.FC<NavbarProps> = ({
               </>
             )}
           </button>
+
+          {isDriveConnected && (
+            <button
+              type="button"
+              onClick={onDisconnectDrive}
+              disabled={isBusy}
+              title={`ออกจากระบบ Google Drive${driveUserLabel ? ` (${driveUserLabel})` : ''}`}
+              aria-label="Sign out of Google Drive"
+              className="p-1.5 text-slate-500 hover:text-red-700 hover:bg-red-50 disabled:opacity-50 border border-slate-200 rounded-lg transition-colors cursor-pointer shrink-0"
+            >
+              <LogOut className="w-3.5 h-3.5" />
+            </button>
+          )}
         </div>
       </div>
     </header>

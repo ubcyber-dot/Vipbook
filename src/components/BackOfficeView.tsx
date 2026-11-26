@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import {
   Plus,
   Trash2,
@@ -18,12 +18,15 @@ import {
   Save,
   Cloud,
   CloudUpload,
+  CloudDownload,
+  LogOut,
   RefreshCw,
   Settings,
   Eye,
   UserCheck,
   Ticket,
   AlertCircle,
+  ArrowRightLeft,
 } from 'lucide-react';
 import {
   CategoryConfig,
@@ -55,16 +58,26 @@ interface BackOfficeViewProps {
   onAddRecord: (categoryId: string, record: SeatRecord) => void;
   onAddMultipleRecords?: (categoryId: string, records: SeatRecord[]) => void;
   onDeleteRecord: (recordId: string) => void;
+  onRequestMoveTable?: (record?: SeatRecord) => void;
   onExportExcel: () => void;
   driveConnection: DriveConnectionState;
   isDriveConnecting: boolean;
   isDriveUploading: boolean;
+  isDriveLoadingBackup?: boolean;
   driveError: string | null;
   lastDriveFile: DriveUploadedFile | null;
   onOpenDriveModal: () => void;
   onConnectGoogleDrive: () => void;
+  onDisconnectGoogleDrive: () => void;
   onQuickSaveToDrive: (format: 'xlsx' | 'json') => void;
+  onLoadFromDrive: () => void;
 }
+
+type ActiveSlipTarget =
+  | { type: 'seat'; seatId: string; slot: 1 | 2 }
+  | { type: 'expense'; expenseId: string }
+  | { type: 'draft-expense' }
+  | null;
 
 export const BackOfficeView: React.FC<BackOfficeViewProps> = ({
   records,
@@ -77,15 +90,19 @@ export const BackOfficeView: React.FC<BackOfficeViewProps> = ({
   onAddRecord,
   onAddMultipleRecords,
   onDeleteRecord,
+  onRequestMoveTable,
   onExportExcel,
   driveConnection,
   isDriveConnecting,
   isDriveUploading,
+  isDriveLoadingBackup = false,
   driveError,
   lastDriveFile,
   onOpenDriveModal,
   onConnectGoogleDrive,
+  onDisconnectGoogleDrive,
   onQuickSaveToDrive,
+  onLoadFromDrive,
 }) => {
   const [subTab, setSubTab] = useState<'expenses' | 'bookings'>('expenses');
 
@@ -97,8 +114,13 @@ export const BackOfficeView: React.FC<BackOfficeViewProps> = ({
   const [expDate, setExpDate] = useState(() => new Date().toLocaleDateString('th-TH'));
   const [expPayee, setExpPayee] = useState('');
   const [expReceiptUrl, setExpReceiptUrl] = useState('');
+  const [expFormError, setExpFormError] = useState<string | null>(null);
   const [expenseFilterCat, setExpenseFilterCat] = useState<string>('all');
   const [expenseSearch, setExpenseSearch] = useState('');
+
+  // Inline 2-click Delete Confirmation States (prevents accidental single-click data loss)
+  const [confirmDeleteExpenseId, setConfirmDeleteExpenseId] = useState<string | null>(null);
+  const [confirmDeleteSeatId, setConfirmDeleteSeatId] = useState<string | null>(null);
 
   // Table Manager State
   const [tableFilterCat, setTableFilterCat] = useState<string>('all');
@@ -108,9 +130,32 @@ export const BackOfficeView: React.FC<BackOfficeViewProps> = ({
   const [tableSearch, setTableSearch] = useState('');
   const [isAddingTable, setIsAddingTable] = useState(false);
 
-  // Popup Edit Modal State
+  // Popup Edit & Live Slip Preview State
   const [activeEditSeatId, setActiveEditSeatId] = useState<string | null>(null);
-  const [activeSlipPreview, setActiveSlipPreview] = useState<SlipPreviewData | null>(null);
+  const [activeSlipTarget, setActiveSlipTarget] = useState<ActiveSlipTarget>(null);
+
+  // Reset tableFilterCat cleanly if a custom category is deleted in Settings
+  useEffect(() => {
+    if (
+      tableFilterCat !== 'all' &&
+      !categories.some((c) => c.id === tableFilterCat)
+    ) {
+      setTableFilterCat('all');
+    }
+  }, [categories, tableFilterCat]);
+
+  // Auto-clear delete confirmations after 4 seconds
+  useEffect(() => {
+    if (!confirmDeleteExpenseId) return;
+    const t = window.setTimeout(() => setConfirmDeleteExpenseId(null), 4000);
+    return () => window.clearTimeout(t);
+  }, [confirmDeleteExpenseId]);
+
+  useEffect(() => {
+    if (!confirmDeleteSeatId) return;
+    const t = window.setTimeout(() => setConfirmDeleteSeatId(null), 4000);
+    return () => window.clearTimeout(t);
+  }, [confirmDeleteSeatId]);
 
   const categoryColorMap = useMemo(() => {
     const map: Record<string, string> = {};
@@ -124,6 +169,85 @@ export const BackOfficeView: React.FC<BackOfficeViewProps> = ({
     () => records.find((r) => r.id === activeEditSeatId) || null,
     [records, activeEditSeatId]
   );
+
+  // Derive activeSlipPreview dynamically from live records/expenses so toggling Paid or replacing slip never uses stale closures!
+  const activeSlipPreview: SlipPreviewData | null = useMemo(() => {
+    if (!activeSlipTarget) return null;
+
+    if (activeSlipTarget.type === 'draft-expense') {
+      if (!expReceiptUrl) return null;
+      return {
+        slipUrl: expReceiptUrl,
+        title: expTitle || 'ตัวอย่างใบเสร็จ / สลิปรายจ่าย',
+        badgeText: getExpenseCategoryLabel(expCategory),
+        accentColor: '#0F172A',
+        amountText: expAmountStr ? `${expAmountStr} บาท` : undefined,
+        dateText: expDate,
+        onReplaceSlipUrl: (newUrl) => setExpReceiptUrl(newUrl),
+      };
+    }
+
+    if (activeSlipTarget.type === 'expense') {
+      const exp = expenses.find((item) => item.id === activeSlipTarget.expenseId);
+      if (!exp || !exp.receiptUrl) return null;
+      const catOpt = EXPENSE_CATEGORY_OPTIONS.find((c) => c.id === exp.category);
+      return {
+        slipUrl: exp.receiptUrl,
+        title: `ใบเสร็จ/สลิปรายจ่าย — ${exp.title}`,
+        subtitle: exp.payeeOrNote ? `ผู้เบิก/ร้านค้า: ${exp.payeeOrNote}` : undefined,
+        badgeText: exp.categoryLabel,
+        accentColor: catOpt?.colorHex || '#0F172A',
+        amountText: formatBaht(exp.amount),
+        dateText: exp.expenseDate || '-',
+        onReplaceSlipUrl: (newUrl) =>
+          onUpdateExpense({
+            ...exp,
+            receiptUrl: newUrl,
+          }),
+      };
+    }
+
+    const seat = records.find((r) => r.id === activeSlipTarget.seatId);
+    if (!seat) return null;
+    const slotUrl = activeSlipTarget.slot === 1 ? seat.slipUrl : seat.slipUrl2 || '';
+    if (!slotUrl) return null;
+    const zoneColor = categoryColorMap[seat.categoryId] || '#2563EB';
+    return {
+      slipUrl: slotUrl,
+      title: `สลิปที่ ${activeSlipTarget.slot} — โต๊ะ ${seat.tableNumber}`,
+      subtitle: seat.fullName
+        ? `ผู้จอง: ${seat.fullName}${seat.phone ? ` (${seat.phone})` : ''}`
+        : `แผ่นงาน ${seat.sheetName} · แถวที่ ${seat.rowNumber}`,
+      badgeText: `โซน ${seat.categoryName} · สลิป ${activeSlipTarget.slot}`,
+      accentColor: zoneColor,
+      amountText: formatBaht(seat.transferAmount, seat.rawTransferAmount),
+      dateText: seat.transferDate || '-',
+      isPaid: seat.isPaid,
+      onTogglePaid: () => {
+        onUpdateRecord(buildUpdatedSeatRecord(seat, { isPaid: !seat.isPaid }));
+      },
+      onReplaceSlipUrl: (newUrl) => {
+        onUpdateRecord(
+          buildUpdatedSeatRecord(
+            seat,
+            activeSlipTarget.slot === 1 ? { slipUrl: newUrl } : { slipUrl2: newUrl }
+          )
+        );
+      },
+    };
+  }, [
+    activeSlipTarget,
+    records,
+    expenses,
+    categoryColorMap,
+    expReceiptUrl,
+    expTitle,
+    expCategory,
+    expAmountStr,
+    expDate,
+    onUpdateRecord,
+    onUpdateExpense,
+  ]);
 
   // Financial Calculations
   const financialStats = useMemo(() => {
@@ -205,13 +329,32 @@ export const BackOfficeView: React.FC<BackOfficeViewProps> = ({
     setExpDate(new Date().toLocaleDateString('th-TH'));
     setExpPayee('');
     setExpReceiptUrl('');
+    setExpFormError(null);
   };
 
   const handleExpenseSubmit = (e: React.FormEvent) => {
     e.preventDefault();
+    setExpFormError(null);
+
     const trimmedTitle = expTitle.trim();
-    const numericAmount = Number(String(expAmountStr).replace(/[,฿\s]|บาท/gi, '').trim());
-    if (!trimmedTitle || !Number.isFinite(numericAmount) || numericAmount < 0) return;
+    if (!trimmedTitle) {
+      setExpFormError('กรุณาระบุชื่อรายการค่าใช้จ่าย');
+      return;
+    }
+
+    const cleanedAmountStr = String(expAmountStr).replace(/[,฿\s]|บาท/gi, '').trim();
+    const numericAmount = cleanedAmountStr === '' ? NaN : Number(cleanedAmountStr);
+    if (!Number.isFinite(numericAmount) || numericAmount < 0) {
+      setExpFormError('กรุณาระบุจำนวนเงินที่ถูกต้อง (ตัวเลขตั้งแต่ 0 ขึ้นไป)');
+      return;
+    }
+
+    const trimmedReceipt = expReceiptUrl.trim();
+    const sanitizedReceipt = sanitizeSafeUrl(trimmedReceipt);
+    if (trimmedReceipt && !sanitizedReceipt) {
+      setExpFormError('ลิงก์ใบเสร็จไม่ถูกต้อง (ต้องขึ้นต้นด้วย https://, http:// หรือแนบรูปภาพ)');
+      return;
+    }
 
     const categoryLabel = getExpenseCategoryLabel(expCategory);
 
@@ -226,7 +369,7 @@ export const BackOfficeView: React.FC<BackOfficeViewProps> = ({
           amount: numericAmount,
           expenseDate: expDate.trim() || new Date().toLocaleDateString('th-TH'),
           payeeOrNote: expPayee.trim(),
-          receiptUrl: sanitizeSafeUrl(expReceiptUrl),
+          receiptUrl: sanitizedReceipt,
         });
       }
     } else {
@@ -237,7 +380,7 @@ export const BackOfficeView: React.FC<BackOfficeViewProps> = ({
         amount: numericAmount,
         expenseDate: expDate.trim() || new Date().toLocaleDateString('th-TH'),
         payeeOrNote: expPayee.trim(),
-        receiptUrl: sanitizeSafeUrl(expReceiptUrl),
+        receiptUrl: sanitizedReceipt,
       });
     }
 
@@ -252,16 +395,42 @@ export const BackOfficeView: React.FC<BackOfficeViewProps> = ({
     setExpDate(exp.expenseDate);
     setExpPayee(exp.payeeOrNote);
     setExpReceiptUrl(exp.receiptUrl);
+    setExpFormError(null);
+  };
+
+  const handleDeleteExpenseClick = (expenseId: string) => {
+    if (confirmDeleteExpenseId !== expenseId) {
+      setConfirmDeleteExpenseId(expenseId);
+      return;
+    }
+    setConfirmDeleteExpenseId(null);
+    if (editingExpenseId === expenseId) {
+      resetExpenseForm();
+    }
+    onDeleteExpense(expenseId);
+  };
+
+  const handleDeleteSeatClick = (seatId: string) => {
+    if (confirmDeleteSeatId !== seatId) {
+      setConfirmDeleteSeatId(seatId);
+      return;
+    }
+    setConfirmDeleteSeatId(null);
+    if (activeEditSeatId === seatId) {
+      setActiveEditSeatId(null);
+    }
+    onDeleteRecord(seatId);
   };
 
   const handleExpenseReceiptUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
+    setExpFormError(null);
     try {
       const dataUrl = await compressImageFileToDataUrl(file);
       setExpReceiptUrl(dataUrl);
-    } catch (err) {
-      console.error('Failed to process receipt image:', err);
+    } catch (err: any) {
+      setExpFormError(err?.message || 'ไม่สามารถอ่านไฟล์รูปใบเสร็จได้');
     } finally {
       e.target.value = '';
     }
@@ -358,15 +527,28 @@ export const BackOfficeView: React.FC<BackOfficeViewProps> = ({
             className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-bold text-slate-700 bg-slate-100 hover:bg-slate-200 border border-slate-300 rounded-xl transition-colors cursor-pointer"
           >
             <Settings className="w-3.5 h-3.5" />
-            Google Drive Settings
+            Drive Settings &amp; Backups
           </button>
 
           {driveConnection.connected ? (
             <>
               <button
                 type="button"
-                onClick={() => onQuickSaveToDrive('xlsx')}
-                disabled={isDriveUploading}
+                onClick={onLoadFromDrive}
+                disabled={isDriveLoadingBackup || isDriveUploading || isDriveConnecting}
+                className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-bold text-blue-700 bg-blue-50 hover:bg-blue-100 border border-blue-300 rounded-xl transition-colors cursor-pointer disabled:opacity-60"
+              >
+                {isDriveLoadingBackup ? (
+                  <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                ) : (
+                  <CloudDownload className="w-3.5 h-3.5" />
+                )}
+                {isDriveLoadingBackup ? 'Loading...' : 'Load from Drive'}
+              </button>
+              <button
+                type="button"
+                onClick={() => onQuickSaveToDrive('json')}
+                disabled={isDriveUploading || isDriveLoadingBackup || isDriveConnecting}
                 className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-bold text-white bg-emerald-600 hover:bg-emerald-700 rounded-xl transition-colors cursor-pointer disabled:opacity-60"
               >
                 {isDriveUploading ? (
@@ -374,16 +556,25 @@ export const BackOfficeView: React.FC<BackOfficeViewProps> = ({
                 ) : (
                   <CloudUpload className="w-3.5 h-3.5" />
                 )}
-                {isDriveUploading ? 'Uploading...' : 'Save Excel to Google Drive'}
+                {isDriveUploading ? 'Saving...' : 'Save JSON Backup'}
               </button>
               <button
                 type="button"
-                onClick={() => onQuickSaveToDrive('json')}
-                disabled={isDriveUploading}
+                onClick={() => onQuickSaveToDrive('xlsx')}
+                disabled={isDriveUploading || isDriveLoadingBackup || isDriveConnecting}
                 className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-bold text-slate-900 bg-white hover:bg-slate-100 border-2 border-slate-300 rounded-xl transition-colors cursor-pointer disabled:opacity-60"
               >
                 <CloudUpload className="w-3.5 h-3.5" />
-                Save JSON Backup
+                Save Excel
+              </button>
+              <button
+                type="button"
+                onClick={onDisconnectGoogleDrive}
+                disabled={isDriveUploading || isDriveLoadingBackup}
+                className="inline-flex items-center gap-1 px-3 py-2 text-xs font-bold text-red-700 bg-red-50 hover:bg-red-100 border border-red-200 rounded-xl transition-colors cursor-pointer disabled:opacity-60"
+              >
+                <LogOut className="w-3.5 h-3.5" />
+                Sign Out
               </button>
             </>
           ) : (
@@ -640,17 +831,7 @@ export const BackOfficeView: React.FC<BackOfficeViewProps> = ({
                   {expReceiptUrl && (
                     <button
                       type="button"
-                      onClick={() =>
-                        setActiveSlipPreview({
-                          slipUrl: expReceiptUrl,
-                          title: expTitle || 'ตัวอย่างใบเสร็จ / สลิปรายจ่าย',
-                          badgeText: getExpenseCategoryLabel(expCategory),
-                          accentColor: '#0F172A',
-                          amountText: expAmountStr ? `${expAmountStr} บาท` : undefined,
-                          dateText: expDate,
-                          onReplaceSlipUrl: (newUrl) => setExpReceiptUrl(newUrl),
-                        })
-                      }
+                      onClick={() => setActiveSlipTarget({ type: 'draft-expense' })}
                       className="inline-flex items-center gap-1 px-3 py-2 text-xs font-bold text-blue-700 bg-blue-50 hover:bg-blue-100 border border-blue-200 rounded-xl cursor-pointer shrink-0"
                     >
                       <Eye className="w-3.5 h-3.5" />
@@ -659,6 +840,13 @@ export const BackOfficeView: React.FC<BackOfficeViewProps> = ({
                   )}
                 </div>
               </div>
+
+              {expFormError && (
+                <div className="p-3 rounded-xl bg-red-50 border border-red-200 flex items-center gap-2 text-xs font-semibold text-red-700">
+                  <AlertCircle className="w-4 h-4 shrink-0" />
+                  <span>{expFormError}</span>
+                </div>
+              )}
 
               <button
                 type="submit"
@@ -796,22 +984,7 @@ export const BackOfficeView: React.FC<BackOfficeViewProps> = ({
                             <button
                               type="button"
                               onClick={() =>
-                                setActiveSlipPreview({
-                                  slipUrl: exp.receiptUrl,
-                                  title: `ใบเสร็จ/สลิปรายจ่าย — ${exp.title}`,
-                                  subtitle: exp.payeeOrNote
-                                    ? `ผู้เบิก/ร้านค้า: ${exp.payeeOrNote}`
-                                    : undefined,
-                                  badgeText: exp.categoryLabel,
-                                  accentColor: catOpt?.colorHex || '#0F172A',
-                                  amountText: formatBaht(exp.amount),
-                                  dateText: exp.expenseDate || '-',
-                                  onReplaceSlipUrl: (newUrl) =>
-                                    onUpdateExpense({
-                                      ...exp,
-                                      receiptUrl: newUrl,
-                                    }),
-                                })
+                                setActiveSlipTarget({ type: 'expense', expenseId: exp.id })
                               }
                               className="inline-flex items-center gap-1 text-[11px] font-bold text-blue-600 hover:text-blue-800 bg-blue-50 hover:bg-blue-100 px-2 py-0.5 rounded-md mt-1 cursor-pointer"
                             >
@@ -832,11 +1005,23 @@ export const BackOfficeView: React.FC<BackOfficeViewProps> = ({
                           </button>
                           <button
                             type="button"
-                            onClick={() => onDeleteExpense(exp.id)}
-                            title="ลบรายการนี้"
-                            className="p-2 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded-lg cursor-pointer"
+                            onClick={() => handleDeleteExpenseClick(exp.id)}
+                            title={
+                              confirmDeleteExpenseId === exp.id
+                                ? 'คลิกอีกครั้งเพื่อยืนยันการลบ'
+                                : 'ลบรายการนี้'
+                            }
+                            className={`rounded-lg cursor-pointer transition-colors ${
+                              confirmDeleteExpenseId === exp.id
+                                ? 'px-2.5 py-1.5 text-xs font-bold text-white bg-red-600 hover:bg-red-700'
+                                : 'p-2 text-slate-400 hover:text-red-600 hover:bg-red-50'
+                            }`}
                           >
-                            <Trash2 className="w-4 h-4" />
+                            {confirmDeleteExpenseId === exp.id ? (
+                              'ยืนยันลบ?'
+                            ) : (
+                              <Trash2 className="w-4 h-4" />
+                            )}
                           </button>
                         </div>
                       </div>
@@ -973,6 +1158,17 @@ export const BackOfficeView: React.FC<BackOfficeViewProps> = ({
                 />
               </div>
 
+              {onRequestMoveTable && (
+                <button
+                  type="button"
+                  onClick={() => onRequestMoveTable()}
+                  className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-bold text-white bg-indigo-600 hover:bg-indigo-700 rounded-xl cursor-pointer shadow-2xs"
+                >
+                  <ArrowRightLeft className="w-4 h-4" />
+                  ย้าย / สลับโต๊ะ
+                </button>
+              )}
+
               <button
                 type="button"
                 onClick={() => setIsAddingTable(true)}
@@ -1049,39 +1245,10 @@ export const BackOfficeView: React.FC<BackOfficeViewProps> = ({
                               <button
                                 type="button"
                                 onClick={() =>
-                                  setActiveSlipPreview({
-                                    slipUrl: seat.slipUrl,
-                                    title: `สลิปที่ 1 — โต๊ะ ${seat.tableNumber}`,
-                                    subtitle: seat.fullName
-                                      ? `ผู้จอง: ${seat.fullName}${seat.phone ? ` (${seat.phone})` : ''}`
-                                      : `แผ่นงาน ${seat.sheetName} · แถวที่ ${seat.rowNumber}`,
-                                    badgeText: `โซน ${seat.categoryName} · สลิป 1`,
-                                    accentColor: zoneColor,
-                                    amountText: formatBaht(
-                                      seat.transferAmount,
-                                      seat.rawTransferAmount
-                                    ),
-                                    dateText: seat.transferDate || '-',
-                                    isPaid: seat.isPaid,
-                                    onTogglePaid: () => {
-                                      const nextPaid = !seat.isPaid;
-                                      const updated = buildUpdatedSeatRecord(seat, {
-                                        isPaid: nextPaid,
-                                      });
-                                      onUpdateRecord(updated);
-                                      setActiveSlipPreview((prev) =>
-                                        prev ? { ...prev, isPaid: nextPaid } : null
-                                      );
-                                    },
-                                    onReplaceSlipUrl: (newUrl) => {
-                                      const updated = buildUpdatedSeatRecord(seat, {
-                                        slipUrl: newUrl,
-                                      });
-                                      onUpdateRecord(updated);
-                                      setActiveSlipPreview((prev) =>
-                                        prev ? { ...prev, slipUrl: newUrl } : null
-                                      );
-                                    },
+                                  setActiveSlipTarget({
+                                    type: 'seat',
+                                    seatId: seat.id,
+                                    slot: 1,
                                   })
                                 }
                                 className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-bold text-blue-700 bg-blue-50 hover:bg-blue-100 border border-blue-200 cursor-pointer transition-colors"
@@ -1094,39 +1261,10 @@ export const BackOfficeView: React.FC<BackOfficeViewProps> = ({
                               <button
                                 type="button"
                                 onClick={() =>
-                                  setActiveSlipPreview({
-                                    slipUrl: seat.slipUrl2 || '',
-                                    title: `สลิปที่ 2 — โต๊ะ ${seat.tableNumber}`,
-                                    subtitle: seat.fullName
-                                      ? `ผู้จอง: ${seat.fullName}${seat.phone ? ` (${seat.phone})` : ''}`
-                                      : `แผ่นงาน ${seat.sheetName} · แถวที่ ${seat.rowNumber}`,
-                                    badgeText: `โซน ${seat.categoryName} · สลิป 2`,
-                                    accentColor: zoneColor,
-                                    amountText: formatBaht(
-                                      seat.transferAmount,
-                                      seat.rawTransferAmount
-                                    ),
-                                    dateText: seat.transferDate || '-',
-                                    isPaid: seat.isPaid,
-                                    onTogglePaid: () => {
-                                      const nextPaid = !seat.isPaid;
-                                      const updated = buildUpdatedSeatRecord(seat, {
-                                        isPaid: nextPaid,
-                                      });
-                                      onUpdateRecord(updated);
-                                      setActiveSlipPreview((prev) =>
-                                        prev ? { ...prev, isPaid: nextPaid } : null
-                                      );
-                                    },
-                                    onReplaceSlipUrl: (newUrl) => {
-                                      const updated = buildUpdatedSeatRecord(seat, {
-                                        slipUrl2: newUrl,
-                                      });
-                                      onUpdateRecord(updated);
-                                      setActiveSlipPreview((prev) =>
-                                        prev ? { ...prev, slipUrl: newUrl } : null
-                                      );
-                                    },
+                                  setActiveSlipTarget({
+                                    type: 'seat',
+                                    seatId: seat.id,
+                                    slot: 2,
                                   })
                                 }
                                 className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-bold text-indigo-700 bg-indigo-50 hover:bg-indigo-100 border border-indigo-200 cursor-pointer transition-colors"
@@ -1238,6 +1376,17 @@ export const BackOfficeView: React.FC<BackOfficeViewProps> = ({
                             <Pencil className="w-3.5 h-3.5" />
                             แก้ไข
                           </button>
+                          {onRequestMoveTable && seat.isBooked && (
+                            <button
+                              type="button"
+                              onClick={() => onRequestMoveTable(seat)}
+                              title="ย้ายหรือสลับโต๊ะนี้"
+                              className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-bold text-indigo-700 bg-indigo-50 hover:bg-indigo-100 border border-indigo-200 rounded-lg cursor-pointer transition-colors"
+                            >
+                              <ArrowRightLeft className="w-3.5 h-3.5" />
+                              ย้ายโต๊ะ
+                            </button>
+                          )}
                           {seat.isBooked && (
                             <button
                               type="button"
@@ -1268,11 +1417,23 @@ export const BackOfficeView: React.FC<BackOfficeViewProps> = ({
                           )}
                           <button
                             type="button"
-                            onClick={() => onDeleteRecord(seat.id)}
-                            title="ลบโต๊ะนี้"
-                            className="p-1.5 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded-lg cursor-pointer"
+                            onClick={() => handleDeleteSeatClick(seat.id)}
+                            title={
+                              confirmDeleteSeatId === seat.id
+                                ? 'คลิกอีกครั้งเพื่อยืนยันการลบโต๊ะนี้'
+                                : 'ลบโต๊ะนี้'
+                            }
+                            className={`rounded-lg cursor-pointer transition-colors ${
+                              confirmDeleteSeatId === seat.id
+                                ? 'px-2.5 py-1 text-xs font-bold text-white bg-red-600 hover:bg-red-700'
+                                : 'p-1.5 text-slate-400 hover:text-red-600 hover:bg-red-50'
+                            }`}
                           >
-                            <Trash2 className="w-4 h-4" />
+                            {confirmDeleteSeatId === seat.id ? (
+                              'ยืนยันลบ?'
+                            ) : (
+                              <Trash2 className="w-4 h-4" />
+                            )}
                           </button>
                         </div>
                       </td>
@@ -1296,6 +1457,9 @@ export const BackOfficeView: React.FC<BackOfficeViewProps> = ({
         categoryColorMap={categoryColorMap}
         onUpdateRecord={onUpdateRecord}
         onDeleteRecord={onDeleteRecord}
+        onRequestMoveTable={
+          onRequestMoveTable ? (rec) => onRequestMoveTable(rec) : undefined
+        }
         defaultEditing={true}
         onClose={() => setActiveEditSeatId(null)}
       />
@@ -1303,7 +1467,7 @@ export const BackOfficeView: React.FC<BackOfficeViewProps> = ({
       {/* Slip / Receipt Image Popup Modal */}
       <SlipPreviewModal
         preview={activeSlipPreview}
-        onClose={() => setActiveSlipPreview(null)}
+        onClose={() => setActiveSlipTarget(null)}
       />
 
       {/* Zone-Colored Add Table Modal (Single & Batch Range) */}

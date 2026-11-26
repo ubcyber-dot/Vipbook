@@ -14,6 +14,7 @@ import {
   UserCheck,
   Ticket,
   Plus,
+  ArrowRightLeft,
 } from 'lucide-react';
 import {
   CategoryConfig,
@@ -41,6 +42,7 @@ interface DashboardViewProps {
   onDeleteRecord?: (recordId: string) => void;
   onAddRecord?: (categoryId: string, record: SeatRecord) => void;
   onAddMultipleRecords?: (categoryId: string, records: SeatRecord[]) => void;
+  onRequestMoveTable?: (record?: SeatRecord) => void;
 }
 
 export function formatPercent(part: number, total: number): string {
@@ -65,6 +67,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   onInspectCategoryInSeatMap,
   onAddRecord,
   onAddMultipleRecords,
+  onRequestMoveTable,
 }) => {
   const [isAddModalOpen, setIsAddModalOpen] = useState<boolean>(false);
 
@@ -214,6 +217,16 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
         </div>
 
         <div className="flex flex-wrap items-center gap-2.5">
+          {onRequestMoveTable && (
+            <button
+              type="button"
+              onClick={() => onRequestMoveTable()}
+              className="inline-flex items-center gap-2 px-3.5 py-2 text-xs font-bold text-white bg-amber-600 hover:bg-amber-700 border-2 border-amber-800 rounded-xl shadow-xs transition-all whitespace-nowrap shrink-0 cursor-pointer"
+            >
+              <ArrowRightLeft className="w-4 h-4" />
+              ย้าย / สลับโต๊ะ
+            </button>
+          )}
           {onAddRecord && (
             <button
               type="button"

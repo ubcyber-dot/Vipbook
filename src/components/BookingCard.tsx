@@ -19,6 +19,7 @@ import {
   Ticket,
   StickyNote,
   Plus,
+  ArrowRightLeft,
 } from 'lucide-react';
 import { SeatRecord } from '../types/booking';
 import { buildUpdatedSeatRecord } from '../utils/excelTemplate';
@@ -33,6 +34,7 @@ interface BookingCardProps {
   categoryColor: string;
   onUpdateRecord?: (updated: SeatRecord) => void;
   onDeleteRecord?: (recordId: string) => void;
+  onRequestMoveTable?: (record: SeatRecord) => void;
   defaultEditing?: boolean;
   embedded?: boolean;
 }
@@ -69,6 +71,7 @@ export const BookingCard: React.FC<BookingCardProps> = ({
   categoryColor,
   onUpdateRecord,
   onDeleteRecord,
+  onRequestMoveTable,
   defaultEditing = false,
   embedded = false,
 }) => {
@@ -95,6 +98,7 @@ export const BookingCard: React.FC<BookingCardProps> = ({
   const [isQuickEditingNote, setIsQuickEditingNote] = useState(false);
   const [quickNoteDraft, setQuickNoteDraft] = useState(record.note || '');
   const [savedNotice, setSavedNotice] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
 
   // Slip Popup Modal State (1 = สลิปที่ 1, 2 = สลิปที่ 2, null = ปิด)
   const [activeSlipSlot, setActiveSlipSlot] = useState<1 | 2 | null>(null);
@@ -119,9 +123,16 @@ export const BookingCard: React.FC<BookingCardProps> = ({
     setNote(record.note || '');
     setQuickNoteDraft(record.note || '');
     setIsQuickEditingNote(false);
+    setConfirmDelete(false);
     setThumbFailed(false);
     setThumb2Failed(false);
   }, [record]);
+
+  useEffect(() => {
+    if (!confirmDelete) return;
+    const t = window.setTimeout(() => setConfirmDelete(false), 4000);
+    return () => window.clearTimeout(t);
+  }, [confirmDelete]);
 
   const slipCandidates = useMemo(
     () => resolveSlipImageCandidates(record.slipUrl || ''),
@@ -355,6 +366,19 @@ export const BookingCard: React.FC<BookingCardProps> = ({
                 แก้ไขข้อมูลโต๊ะ
               </button>
             )}
+            {onRequestMoveTable && !isEditing && record.isBooked && (
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onRequestMoveTable(record);
+                }}
+                className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl text-xs font-bold bg-indigo-600 text-white hover:bg-indigo-700 border-2 border-white/80 shadow-xs transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+              >
+                <ArrowRightLeft className="w-3.5 h-3.5" />
+                ย้ายโต๊ะ
+              </button>
+            )}
             {savedNotice && (
               <span className="px-2.5 py-1 rounded-lg text-xs font-bold bg-emerald-500 text-white border border-white/40 shadow-2xs">
                 บันทึกข้อมูลเรียบร้อยแล้ว
@@ -501,12 +525,21 @@ export const BookingCard: React.FC<BookingCardProps> = ({
                     type="button"
                     onClick={(e) => {
                       e.stopPropagation();
+                      if (!confirmDelete) {
+                        setConfirmDelete(true);
+                        return;
+                      }
+                      setConfirmDelete(false);
                       onDeleteRecord(record.id);
                     }}
-                    className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-red-700 bg-red-50 hover:bg-red-100 border border-red-200 rounded-lg transition-colors cursor-pointer"
+                    className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg transition-colors cursor-pointer ${
+                      confirmDelete
+                        ? 'text-white bg-red-600 hover:bg-red-700 border border-red-700'
+                        : 'text-red-700 bg-red-50 hover:bg-red-100 border border-red-200'
+                    }`}
                   >
                     <Trash2 className="w-3.5 h-3.5" />
-                    ลบโต๊ะนี้
+                    {confirmDelete ? 'คลิกอีกครั้งเพื่อยืนยันลบ' : 'ลบโต๊ะนี้'}
                   </button>
                 )}
               </div>
